@@ -2,6 +2,25 @@
 
 Analyses trackpy CSV files from bacterial tracking experiments and produces 19 motility metrics per condition, plus cross-condition statistical comparisons.
 
+## Requirements
+
+Python 3.9+ and the following packages:
+
+| Package | Version |
+|---------|---------|
+| numpy | ≥ 1.24 |
+| pandas | ≥ 1.5 |
+| matplotlib | ≥ 3.6 |
+| scipy | ≥ 1.10 |
+
+`tkinter` is used for the GUI and is included with most Python installations.
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
 ## Launch the GUI
 
 ```bash
