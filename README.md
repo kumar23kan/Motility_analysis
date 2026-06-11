@@ -5,16 +5,17 @@ Analyses trackpy CSV files from bacterial tracking experiments and produces 19 m
 ## Launch the GUI
 
 ```bash
-cd Motility_analysis
-python3 motility_gui.py
+cd Motility_analysis        # folder that contains the data/ subfolder
+python3 motility_gui.py     # then use Add Files to select CSVs from data/
 ```
 
 ## Command-line usage
 
 ```bash
-python3 analyze_motility.py data.csv
-python3 analyze_motility.py file1.csv file2.csv file3.csv --fps 50 --px-per-um 50
-python3 analyze_motility.py data.csv --skip-bac-bac --output-dir results/
+cd Motility_analysis
+python3 analyze_motility.py "data/C10 16 hours tracking.csv"
+python3 analyze_motility.py "data/C10 16 hours tracking.csv" "data/C10 18 hours tracking.csv" "data/C10 23 hours tracking.csv" --fps 50 --px-per-um 50
+python3 analyze_motility.py "data/C10 16 hours tracking.csv" --skip-bac-bac --output-dir results/
 ```
 
 ## Input
