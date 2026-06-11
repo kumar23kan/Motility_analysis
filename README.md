@@ -21,11 +21,11 @@ python3 analyze_motility.py data.csv --skip-bac-bac --output-dir results/
 
 Trackpy CSV with columns: `y, x, mass, size, ecc, signal, raw_mass, ep, frame, particle`
 
-Default input files:
+Input files are stored in the `data/` folder:
 ```
-../graphs/C10 16 hours tracking.csv
-../graphs/C10 18 hours tracking.csv
-../graphs/C10 23 hours tracking.csv
+data/C10 16 hours tracking.csv
+data/C10 18 hours tracking.csv
+data/C10 23 hours tracking.csv
 ```
 
 ## Key parameters
