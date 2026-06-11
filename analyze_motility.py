@@ -116,7 +116,7 @@ def parse_args():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_and_filter(csv_path, min_track_length, ep_max):
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, encoding='latin-1')
     n_raw = len(df)
     df = df[df['ep'].abs() < ep_max]
     n_ep = len(df)
