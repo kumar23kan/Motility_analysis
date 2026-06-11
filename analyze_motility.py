@@ -1630,6 +1630,7 @@ def analyze_file(csv_path, args, root_out):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     args     = parse_args()
     root_out = Path(args.output_dir)
     root_out.mkdir(parents=True, exist_ok=True)
