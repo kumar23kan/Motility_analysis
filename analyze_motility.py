@@ -116,7 +116,15 @@ def parse_args():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_and_filter(csv_path, min_track_length, ep_max):
-    df = pd.read_csv(csv_path, encoding='latin-1')
+    for enc in ('utf-8-sig', 'latin-1', 'utf-8', 'cp1252'):
+        try:
+            df = pd.read_csv(csv_path, encoding=enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        raise ValueError(f"Cannot read {csv_path} — tried utf-8-sig, latin-1, utf-8, cp1252")
+    df.columns = df.columns.str.strip().str.lstrip('﻿')
     n_raw = len(df)
     df = df[df['ep'].abs() < ep_max]
     n_ep = len(df)
