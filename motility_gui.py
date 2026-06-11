@@ -383,7 +383,7 @@ class MotilityGUI(tk.Tk):
         self._log_write(
             f'Files : {n} CSV file{"s" if n != 1 else ""}\n'
             f'Output: {self.out_var.get()}\n'
-            f'{'─' * 60}\n\n', 'hdr',
+            f'{"─" * 60}\n\n', 'hdr',
         )
 
         self.progress.start(12)
