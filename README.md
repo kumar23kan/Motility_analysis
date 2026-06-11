@@ -5,7 +5,7 @@ Analyses trackpy CSV files from bacterial tracking experiments and produces 19 m
 ## Launch the GUI
 
 ```bash
-cd /home/kumar-perinbam/Research/G-force/Motility_analysis-tool
+cd Motility_analysis
 python3 motility_gui.py
 ```
 
