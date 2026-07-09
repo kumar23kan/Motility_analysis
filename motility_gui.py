@@ -10,6 +10,7 @@ Tab 2 · Analysis Only  : pre-tracked CSV files → analyse
 
 import sys
 import os
+import re
 import json
 import tempfile
 import threading
@@ -28,10 +29,11 @@ except ImportError:
     _HAS_CV2 = False
 
 try:
-    from PIL import Image as _PImage, ImageTk as _ImageTk
+    from PIL import Image as _PImage, ImageTk as _ImageTk, ImageDraw as _PImageDraw
     _HAS_PIL = True
 except ImportError:
     _HAS_PIL = False
+    _PImageDraw = None
 
 # Force UTF-8 output on Windows
 if hasattr(sys.stdout, 'reconfigure'):
@@ -567,6 +569,329 @@ class _ROIEditor(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Detection parameter tuner
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _ParamTuner(tk.Toplevel):
+    """
+    Interactive single-frame detection previewer.
+
+    Loads every TIFF from a folder (same preprocessing as auto_tracking.py),
+    runs trackpy.locate() on the selected frame with the current parameters,
+    and draws detected cells as cyan circles so the user can visually verify
+    that bacteria (not background) are being picked up.
+
+    Clicking "Apply to Pipeline" writes the tuned values back to the main GUI.
+    """
+
+    _IMG_W, _IMG_H = 1232, 1028   # must match auto_tracking.py resize
+
+    def __init__(self, parent, folder: str | None,
+                 pixel_size_var, diameter_var, minmass_var):
+        super().__init__(parent)
+        self.title('Detection Parameter Tuner')
+        self.geometry('1150x720')
+        self.minsize(900, 580)
+        self.transient(parent)
+
+        self._folder        = Path(folder) if folder else None
+        self._pixel_size_var = pixel_size_var
+        self._diameter_var  = diameter_var    # write-back targets (main GUI vars)
+        self._minmass_var   = minmass_var
+
+        self._frames: list = []               # preprocessed numpy arrays
+        self._frame_idx  = 0
+        self._detections = None               # pd.DataFrame from tp.locate
+        self._photo      = None               # keep PhotoImage reference
+        self._debounce_id = None
+
+        # Local copies of parameters (so user can cancel without affecting pipeline)
+        self._diam = tk.IntVar(value=int(diameter_var.get()))
+        self._mass = tk.DoubleVar(value=float(minmass_var.get()))
+
+        self._build()
+        if self._folder:
+            threading.Thread(target=self._load_frames, daemon=True).start()
+        else:
+            self._status_var.set('No folder selected — add a folder in the Pipeline tab first.')
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build(self):
+        pw = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        pw.pack(fill=tk.BOTH, expand=True, padx=6, pady=(6, 0))
+
+        left  = ttk.Frame(pw)
+        right = ttk.Frame(pw, padding=(10, 4))
+        pw.add(left,  weight=5)
+        pw.add(right, weight=2)
+
+        # ── Left: canvas + frame slider ───────────────────────────────────────
+        self._canvas = tk.Canvas(left, bg='#111', cursor='crosshair')
+        self._canvas.pack(fill=tk.BOTH, expand=True)
+        self._canvas.bind('<Configure>', lambda _e: self._draw_overlay())
+
+        sf = ttk.Frame(left)
+        sf.pack(fill=tk.X, padx=4, pady=(3, 0))
+        ttk.Label(sf, text='Frame:').pack(side=tk.LEFT)
+        self._frame_slider = ttk.Scale(sf, from_=0, to=0, orient=tk.HORIZONTAL,
+                                        command=self._on_frame)
+        self._frame_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        self._frame_lbl = ttk.Label(sf, text='– / –', width=10)
+        self._frame_lbl.pack(side=tk.LEFT)
+
+        # ── Right: controls ───────────────────────────────────────────────────
+        ttk.Label(right, text='Adjust Detection Parameters',
+                  font=('TkDefaultFont', 10, 'bold')).pack(anchor='w', pady=(0, 6))
+
+        # Diameter
+        df = ttk.LabelFrame(right, text=' Feature Diameter (px) ', padding=6)
+        df.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(df, text='Odd integer ≈ apparent cell width in pixels',
+                  foreground='grey', font=('TkDefaultFont', 8)).pack(anchor='w')
+        dr = ttk.Frame(df); dr.pack(fill=tk.X, pady=(4, 0))
+        self._diam_scale = ttk.Scale(dr, from_=3, to=31, variable=self._diam,
+                                      orient=tk.HORIZONTAL,
+                                      command=self._on_diam)
+        self._diam_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e = ttk.Entry(dr, textvariable=self._diam, width=5)
+        e.pack(side=tk.LEFT, padx=(4, 0))
+        e.bind('<Return>', self._on_diam)
+
+        # Min mass
+        mf = ttk.LabelFrame(right, text=' Min Mass (integrated brightness) ', padding=6)
+        mf.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(mf, text='Raise to reject dim background; lower to capture faint cells',
+                  foreground='grey', font=('TkDefaultFont', 8)).pack(anchor='w')
+        mr = ttk.Frame(mf); mr.pack(fill=tk.X, pady=(4, 0))
+        self._mass_scale = ttk.Scale(mr, from_=0, to=3000, variable=self._mass,
+                                      orient=tk.HORIZONTAL,
+                                      command=self._on_mass)
+        self._mass_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e2 = ttk.Entry(mr, textvariable=self._mass, width=8)
+        e2.pack(side=tk.LEFT, padx=(4, 0))
+        e2.bind('<Return>', self._on_mass)
+
+        # Stats box
+        sf2 = ttk.LabelFrame(right, text=' Detection Stats ', padding=6)
+        sf2.pack(fill=tk.X, pady=(0, 8))
+        self._stats_var = tk.StringVar(value='—')
+        ttk.Label(sf2, textvariable=self._stats_var,
+                  font=('TkFixedFont', 9), justify='left').pack(anchor='w')
+
+        # Legend
+        lf = ttk.LabelFrame(right, text=' Overlay ', padding=6)
+        lf.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(lf,
+                  text='Cyan circle  =  detected cell\n'
+                       'Circle size  =  feature diameter\n'
+                       'Brighter cyan  =  higher mass\n'
+                       'Yellow dot  =  centroid',
+                  foreground='grey', font=('TkDefaultFont', 8),
+                  justify='left').pack(anchor='w')
+
+        ttk.Separator(right).pack(fill=tk.X, pady=6)
+
+        ttk.Button(right, text='✓  Apply to Pipeline',
+                   style='Run.TButton',
+                   command=self._apply).pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(right, text='Close without applying',
+                   command=self.destroy).pack(fill=tk.X)
+
+        # Status bar
+        self._status_var = tk.StringVar(value='Loading frames…')
+        ttk.Label(self, textvariable=self._status_var,
+                  relief='sunken', anchor='w',
+                  padding=(6, 2)).pack(fill=tk.X, padx=6, pady=(4, 6))
+
+    # ── Frame loading (background thread) ─────────────────────────────────────
+
+    def _load_frames(self):
+        if not _HAS_CV2:
+            self.after(0, lambda: self._status_var.set(
+                'cv2 not available — cannot load TIFF frames.'))
+            return
+        tiffs = sorted(
+            list(self._folder.glob('*.tiff')) + list(self._folder.glob('*.tif')),
+            key=lambda p: int(re.findall(r'\d+', p.stem)[-1])
+                if re.findall(r'\d+', p.stem) else 0
+        )
+        if not tiffs:
+            self.after(0, lambda: self._status_var.set(
+                f'No TIFF files found in {self._folder}'))
+            return
+
+        clahe = _cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        frames = []
+        n = len(tiffs)
+        for i, path in enumerate(tiffs):
+            img = _cv2.imread(str(path), _cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+            img = _cv2.resize(img, (self._IMG_W, self._IMG_H))
+            img = clahe.apply(img)
+            img = _cv2.GaussianBlur(img, (3, 3), 0)
+            frames.append(img)
+            if i % 5 == 0:
+                self.after(0, lambda i=i: self._status_var.set(
+                    f'Loading frames… {i+1}/{n}'))
+        self._frames = frames
+        self.after(0, self._on_frames_ready)
+
+    def _on_frames_ready(self):
+        n = len(self._frames)
+        if n == 0:
+            self._status_var.set('No frames could be loaded.')
+            return
+        self._frame_slider.configure(to=max(0, n - 1))
+        self._frame_lbl.config(text=f'1 / {n}')
+        self._status_var.set(f'Loaded {n} frames.  Running detection…')
+        self._schedule_detect()
+
+    # ── Parameter change handlers ─────────────────────────────────────────────
+
+    def _on_frame(self, _val=None):
+        idx = int(float(self._frame_slider.get()))
+        self._frame_idx = idx
+        n = len(self._frames)
+        self._frame_lbl.config(text=f'{idx+1} / {n}')
+        self._schedule_detect()
+
+    def _on_diam(self, _val=None):
+        d = int(float(self._diam.get()))
+        if d % 2 == 0:
+            d = max(3, d + 1)
+            self._diam.set(d)
+        self._schedule_detect()
+
+    def _on_mass(self, _val=None):
+        self._schedule_detect()
+
+    def _schedule_detect(self):
+        if self._debounce_id:
+            self.after_cancel(self._debounce_id)
+        self._debounce_id = self.after(350, self._run_detect)
+
+    # ── Detection (background thread) ─────────────────────────────────────────
+
+    def _run_detect(self):
+        if not self._frames:
+            return
+        frame = self._frames[self._frame_idx]
+        diam  = int(self._diam.get())
+        if diam % 2 == 0:
+            diam += 1
+        mass  = float(self._mass.get())
+        self._status_var.set(
+            f'Detecting…  diameter={diam}  min_mass={mass:.0f}')
+        threading.Thread(
+            target=self._detect_worker,
+            args=(frame.copy(), diam, mass),
+            daemon=True,
+        ).start()
+
+    def _detect_worker(self, frame, diam, mass):
+        try:
+            import trackpy as tp
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                feats = tp.locate(frame, diameter=diam, minmass=mass, processes=1)
+        except Exception as exc:
+            self.after(0, lambda: self._status_var.set(f'Detection error: {exc}'))
+            return
+        self.after(0, lambda f=feats, d=diam, m=mass:
+                   self._on_detect_done(f, d, m))
+
+    def _on_detect_done(self, feats, diam, mass):
+        self._detections = feats
+        n = len(feats)
+        px = self._pixel_size_var.get()
+        if n > 0:
+            stats = (
+                f'Cells detected : {n:,}\n'
+                f'Mass range     : {feats["mass"].min():.0f} – {feats["mass"].max():.0f}\n'
+                f'Mean mass      : {feats["mass"].mean():.0f}\n'
+                f'Cell size      : {diam} px  ({diam * px:.2f} µm)'
+            )
+        else:
+            stats = ('No cells detected\n'
+                     '→ lower Min Mass, or\n'
+                     '→ adjust Feature Diameter')
+        self._stats_var.set(stats)
+        self._status_var.set(
+            f'Frame {self._frame_idx+1}/{len(self._frames)}  —  '
+            f'{n:,} detections  (diameter={diam}, min_mass={mass:.0f})'
+        )
+        self._draw_overlay()
+
+    # ── Overlay rendering ─────────────────────────────────────────────────────
+
+    def _draw_overlay(self):
+        if not self._frames or not _HAS_PIL:
+            if not _HAS_PIL:
+                self._canvas_msg('PIL/Pillow not available — cannot display overlay')
+            return
+
+        frame = self._frames[self._frame_idx]
+        img   = _PImage.fromarray(frame).convert('RGB')
+        draw  = _PImageDraw.Draw(img, 'RGBA')
+
+        if self._detections is not None and len(self._detections) > 0:
+            diam = int(self._diam.get())
+            r    = diam / 2.0
+            df   = self._detections
+            m_lo = float(df['mass'].min())
+            m_hi = float(df['mass'].max())
+            span = max(m_hi - m_lo, 1.0)
+
+            for _, row in df.iterrows():
+                x, y = float(row['x']), float(row['y'])
+                t    = (float(row['mass']) - m_lo) / span   # 0=dim, 1=bright
+                # Cyan: dim → (0,160,200), bright → (0,255,255)
+                g = int(160 + 95 * t)
+                b = int(200 + 55 * t)
+                color = (0, g, b)
+                # Filled semi-transparent circle
+                draw.ellipse([x-r, y-r, x+r, y+r],
+                             fill=(0, g, b, 50), outline=color, width=2)
+                # Yellow centroid dot
+                draw.ellipse([x-2, y-2, x+2, y+2], fill=(255, 220, 0))
+
+        # Scale to canvas size
+        cw = max(self._canvas.winfo_width(),  100)
+        ch = max(self._canvas.winfo_height(), 100)
+        scale = min(cw / img.width, ch / img.height)
+        w = max(1, int(img.width  * scale))
+        h = max(1, int(img.height * scale))
+        try:
+            resamp = _PImage.Resampling.LANCZOS
+        except AttributeError:
+            resamp = _PImage.LANCZOS  # type: ignore[attr-defined]
+        self._photo = _ImageTk.PhotoImage(img.resize((w, h), resamp))
+        self._canvas.delete('all')
+        self._canvas.create_image(0, 0, anchor='nw', image=self._photo)
+
+    def _canvas_msg(self, text: str):
+        self._canvas.delete('all')
+        cx = max(self._canvas.winfo_width(),  400) // 2
+        cy = max(self._canvas.winfo_height(), 300) // 2
+        self._canvas.create_text(cx, cy, text=text,
+                                  fill='#888', font=('TkDefaultFont', 12),
+                                  justify='center')
+
+    # ── Apply ─────────────────────────────────────────────────────────────────
+
+    def _apply(self):
+        d = int(self._diam.get())
+        if d % 2 == 0:
+            d += 1
+        self._diameter_var.set(d)
+        self._minmass_var.set(round(float(self._mass.get()), 1))
+        self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main window
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -706,6 +1031,9 @@ class MotilityGUI(tk.Tk):
                   text='FPS and pixel size are shared with the analysis step automatically.',
                   foreground='grey', font=('TkDefaultFont', 8),
                   ).grid(row=7, column=0, columnspan=3, sticky='w')
+        ttk.Button(p, text='🔬  Preview cell detection on a frame…',
+                   command=self._open_tuner,
+                   ).grid(row=8, column=0, columnspan=3, sticky='w', pady=(10, 0))
 
     def _build_pl_analysis_tab(self, p):
         p.columnconfigure(2, weight=1)
@@ -736,6 +1064,25 @@ class MotilityGUI(tk.Tk):
         ttk.Checkbutton(p, text='Skip pair correlation g(r)  (slow for large datasets)',
                         variable=self.pl_skip_gr_var,
                         ).grid(row=5, column=0, columnspan=3, sticky='w')
+
+    # ── Parameter tuner launcher ──────────────────────────────────────────────
+
+    def _open_tuner(self):
+        folder = self._folders[0] if self._folders else None
+        if folder is None:
+            messagebox.showinfo(
+                'No folder selected',
+                'Add at least one image folder in the pipeline tab first,\n'
+                'then open the tuner to preview detection on a real frame.',
+                parent=self,
+            )
+            return
+        _ParamTuner(
+            self, folder,
+            pixel_size_var=self.pixel_size_var,
+            diameter_var=self.diameter_var,
+            minmass_var=self.trk_minmass_var,
+        )
 
     # ── ROI panel ─────────────────────────────────────────────────────────────
 
