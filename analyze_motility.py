@@ -38,6 +38,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 import warnings
 from pathlib import Path
@@ -83,8 +84,11 @@ def parse_args():
     filt = p.add_argument_group('Filtering')
     filt.add_argument('--min-track-length', type=int, default=10,
                       help='Minimum track length (frames) to include')
-    filt.add_argument('--ep-max', type=float, default=5.0,
+    filt.add_argument('--ep-max', type=float, default=1.0,
                       help='Maximum absolute localization error |ep| to keep')
+    filt.add_argument('--min-mass', type=float, default=0.0,
+                      help='Minimum integrated intensity (mass) to keep; '
+                           'raise this to reject dim background features')
 
     ana = p.add_argument_group('Analysis parameters')
     ana.add_argument('--bac-radius', type=float, default=0.5,
@@ -109,6 +113,12 @@ def parse_args():
                      help='Bottom boundary of arena (µm)')
     bnd.add_argument('--boundary-y-hi', type=float, default=None,
                      help='Top boundary of arena (µm)')
+    bnd.add_argument('--roi-polygon-file', type=str, default=None,
+                     help='JSON file with polygonal ROI: '
+                          '{"vertices": [[x,y],...], "image_w": W, "image_h": H} '
+                          '(pixel coords matching the tracking CSV). '
+                          'Detections outside the polygon are excluded; '
+                          'boundary collisions use polygon-edge proximity instead of rectangle.')
 
     out = p.add_argument_group('Output')
     out.add_argument('--output-dir', type=str, default='motility_analysis',
@@ -118,10 +128,73 @@ def parse_args():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ROI polygon helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_roi_polygon(path):
+    """Load ROI from JSON. Returns (vertices_px np.ndarray shape (N,2), image_w, image_h) or None."""
+    if path is None:
+        return None
+    with open(path) as f:
+        data = json.load(f)
+    verts = np.array(data['vertices'], dtype=float)  # (N, 2) in pixel coords
+    return verts, data.get('image_w'), data.get('image_h')
+
+
+def _polygon_area_um2(vertices_px, px_per_um):
+    """Shoelace formula for polygon area in µm²."""
+    x, y = vertices_px[:, 0], vertices_px[:, 1]
+    area_px2 = abs(float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))) / 2.0
+    return area_px2 / (px_per_um ** 2)
+
+
+def apply_roi_mask(df, vertices_px):
+    """Return (df_inside, df_outside) based on polygon membership."""
+    from matplotlib.path import Path as MPath
+    poly = MPath(np.vstack([vertices_px, vertices_px[:1]]))
+    inside = poly.contains_points(df[['x', 'y']].values)
+    return df[inside].copy(), df[~inside].copy()
+
+
+def compute_polygon_boundary_collisions(df, vertices_px, px_per_um, bac_radius_um, fps):
+    """Detect detections within bac_radius of any polygon edge."""
+    r_px = bac_radius_um * px_per_um
+    pts = df[['x', 'y']].values.astype(float)
+    n = len(vertices_px)
+    min_dists = np.full(len(pts), np.inf)
+    for i in range(n):
+        A = vertices_px[i].astype(float)
+        B = vertices_px[(i + 1) % n].astype(float)
+        AB = B - A
+        AB_len2 = float(np.dot(AB, AB))
+        if AB_len2 < 1e-10:
+            dists = np.linalg.norm(pts - A, axis=1)
+        else:
+            t = np.clip(((pts - A) @ AB) / AB_len2, 0.0, 1.0)
+            proj = A + t[:, np.newaxis] * AB
+            dists = np.linalg.norm(pts - proj, axis=1)
+        np.minimum(min_dists, dists, out=min_dists)
+    near = min_dists < r_px
+    ev = df[near].copy()
+    ev['x_um'] = ev['x'] / px_per_um
+    ev['y_um'] = ev['y'] / px_per_um
+    ev['wall'] = 'polygon_edge'
+    n_tracks = df['particle'].nunique()
+    duration = df['frame'].nunique() / fps
+    freq = len(ev) / (n_tracks * duration) if n_tracks > 0 and duration > 0 else 0.0
+    return {
+        'total_events':        len(ev),
+        'freq_per_cell_per_s': freq,
+        'wall_counts':         {'polygon_edge': len(ev)},
+        'events_df':           ev,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Data loading & preparation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_and_filter(csv_path, min_track_length, ep_max):
+def load_and_filter(csv_path, min_track_length, ep_max, min_mass=0.0, roi_vertices=None):
     for enc in ('utf-8-sig', 'latin-1', 'utf-8', 'cp1252'):
         try:
             df = pd.read_csv(csv_path, encoding=enc)
@@ -134,12 +207,24 @@ def load_and_filter(csv_path, min_track_length, ep_max):
     n_raw = len(df)
     df = df[df['ep'].abs() < ep_max]
     n_ep = len(df)
+    if min_mass > 0 and 'mass' in df.columns:
+        df = df[df['mass'] >= min_mass]
+    n_mass = len(df)
+    if roi_vertices is not None:
+        df, df_out = apply_roi_mask(df, roi_vertices)
+        n_roi = len(df)
+    else:
+        n_roi = None
     track_len = df.groupby('particle')['frame'].count()
     valid_ids = track_len[track_len >= min_track_length].index
     df = df[df['particle'].isin(valid_ids)].copy()
     df = df.sort_values(['particle', 'frame']).reset_index(drop=True)
     print(f"  {n_raw:>9,}  raw detections")
     print(f"  {n_ep:>9,}  after |ep| < {ep_max}  ({n_raw - n_ep:,} removed)")
+    if min_mass > 0:
+        print(f"  {n_mass:>9,}  after mass >= {min_mass}  ({n_ep - n_mass:,} removed)")
+    if n_roi is not None:
+        print(f"  {n_roi:>9,}  inside ROI polygon  ({n_mass - n_roi:,} outside → excluded)")
     print(f"  {len(df):>9,}  after min-track-length = {min_track_length}")
     print(f"  {df['particle'].nunique():>9,}  valid tracks kept")
     return df
@@ -428,8 +513,9 @@ def compute_boundary_collisions(df, px_per_um, bac_radius_um, fps,
 
     nl = df['x'] <= x_lo + r_px
     nr = df['x'] >= x_hi - r_px
-    nb = df['y'] <= y_lo + r_px
-    nt = df['y'] >= y_hi - r_px
+    # In image coordinates y=0 is the top edge, y_hi is the bottom edge
+    nt = df['y'] <= y_lo + r_px
+    nb = df['y'] >= y_hi - r_px
     ev = df[nl | nr | nb | nt].copy()
     ev['x_um'] = ev['x'] / px_per_um
     ev['y_um'] = ev['y'] / px_per_um
@@ -1282,11 +1368,21 @@ def analyze_file(csv_path, args, root_out):
     out_dir = root_out / name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f'\n{"=" * 64}')
-    print(f'  {Path(csv_path).name}')
-    print(f'{"=" * 64}')
+    print(f'\n{"=" * 64}', flush=True)
+    print(f'  {Path(csv_path).name}', flush=True)
+    print(f'{"=" * 64}', flush=True)
 
-    df_raw = load_and_filter(csv_path, args.min_track_length, args.ep_max)
+    # Load ROI polygon if specified
+    roi_verts = None
+    roi_area_um2 = None
+    image_w = image_h = None
+    if args.roi_polygon_file:
+        result = load_roi_polygon(args.roi_polygon_file)
+        if result is not None:
+            roi_verts, image_w, image_h = result
+
+    df_raw = load_and_filter(csv_path, args.min_track_length, args.ep_max,
+                             args.min_mass, roi_vertices=roi_verts)
     df     = add_micron_coords(df_raw, args.px_per_um)
 
     fps       = args.fps
@@ -1296,23 +1392,42 @@ def analyze_file(csv_path, args, root_out):
     arena_y   = df['y'].max() / px_per_um
     duration  = df['frame'].nunique() / fps
 
-    # Boundary: use user-supplied values or fall back to data extent
-    bnd_x_lo = args.boundary_x_lo if args.boundary_x_lo is not None else df['x_um'].min()
-    bnd_x_hi = args.boundary_x_hi if args.boundary_x_hi is not None else df['x_um'].max()
-    bnd_y_lo = args.boundary_y_lo if args.boundary_y_lo is not None else df['y_um'].min()
-    bnd_y_hi = args.boundary_y_hi if args.boundary_y_hi is not None else df['y_um'].max()
-    bnd_source = 'user-specified' if any(v is not None for v in [
-        args.boundary_x_lo, args.boundary_x_hi,
-        args.boundary_y_lo, args.boundary_y_hi]) else 'auto-detected'
+    # ROI area summary
+    if roi_verts is not None:
+        roi_area_um2 = _polygon_area_um2(roi_verts, px_per_um)
+        if image_w and image_h:
+            total_area_um2 = (image_w * image_h) / (px_per_um ** 2)
+            unmasked_um2   = total_area_um2 - roi_area_um2
+        else:
+            total_area_um2 = unmasked_um2 = None
+
+    # Boundary: use ROI polygon → else user-supplied rectangle → else data extent
+    if roi_verts is not None:
+        bnd_source = 'polygon ROI'
+        bnd_x_lo = bnd_x_hi = bnd_y_lo = bnd_y_hi = None
+    else:
+        bnd_x_lo = args.boundary_x_lo if args.boundary_x_lo is not None else df['x_um'].min()
+        bnd_x_hi = args.boundary_x_hi if args.boundary_x_hi is not None else df['x_um'].max()
+        bnd_y_lo = args.boundary_y_lo if args.boundary_y_lo is not None else df['y_um'].min()
+        bnd_y_hi = args.boundary_y_hi if args.boundary_y_hi is not None else df['y_um'].max()
+        bnd_source = 'user-specified' if any(v is not None for v in [
+            args.boundary_x_lo, args.boundary_x_hi,
+            args.boundary_y_lo, args.boundary_y_hi]) else 'auto-detected'
 
     print(f"\n  Arena            : {arena_x:.2f} × {arena_y:.2f} µm")
     print(f"  Recording window : {duration:.3f} s  ({df['frame'].nunique()} frames @ {fps} fps)")
-    print(f"  Boundary ({bnd_source}): "
-          f"X [{bnd_x_lo:.2f}, {bnd_x_hi:.2f}]  "
-          f"Y [{bnd_y_lo:.2f}, {bnd_y_hi:.2f}] µm\n")
+    if roi_verts is not None:
+        print(f"  ROI polygon      : {len(roi_verts)} vertices  "
+              f"masked area = {roi_area_um2:.2f} µm²"
+              + (f"  unmasked = {unmasked_um2:.2f} µm²" if unmasked_um2 else ''))
+    else:
+        print(f"  Boundary ({bnd_source}): "
+              f"X [{bnd_x_lo:.2f}, {bnd_x_hi:.2f}]  "
+              f"Y [{bnd_y_lo:.2f}, {bnd_y_hi:.2f}] µm")
+    print()
 
     # ── 1. Speed ──────────────────────────────────────────────────────────────
-    print('[1 ] Swimming speed ...')
+    print('[1 ] Swimming speed ...', flush=True)
     speeds = compute_speeds(df, fps)
     pt_df  = compute_per_track_speeds(df, fps)
     sp = {
@@ -1327,14 +1442,14 @@ def analyze_file(csv_path, args, root_out):
           f"Std {sp['std_um_s']:.3f} µm/s  (n={sp['n_steps']:,})")
 
     # ── 2. MSD ────────────────────────────────────────────────────────────────
-    print('[2 ] MSD ...')
+    print('[2 ] MSD ...', flush=True)
     lt, mv, nc = compute_msd(df, fps, args.max_lag)
     D, alpha   = fit_msd(lt, mv)
     if D is not None:
         print(f"      D = {D:.5f} µm²/s   α = {alpha:.3f}   → {motion_label(alpha)}")
 
     # ── 3. Directional autocorrelation ────────────────────────────────────────
-    print('[3 ] Directional autocorrelation ...')
+    print('[3 ] Directional autocorrelation ...', flush=True)
     dac_lt, dac_ct, dac_n = compute_directional_autocorr(df, fps, args.max_lag)
     tau_p = fit_persistence(dac_lt, dac_ct)
     persist_len = sp['mean_um_s'] * tau_p if tau_p is not None else None
@@ -1342,19 +1457,19 @@ def analyze_file(csv_path, args, root_out):
         print(f"      τ_p = {tau_p*1000:.1f} ms   persistence length ≈ {persist_len:.4f} µm")
 
     # ── 4. Run-and-tumble ─────────────────────────────────────────────────────
-    print('[4 ] Run-and-tumble ...')
+    print('[4 ] Run-and-tumble ...', flush=True)
     rt = compute_run_tumble(df, fps, args.tumble_angle)
     print(f"      Mean run {rt['mean_run_length_um']:.4f} µm  "
           f"Tumble freq {rt['tumble_frequency_hz']:.2f} Hz  "
           f"Tumble frac {rt['tumble_fraction']:.2%}")
 
     # ── 5. Drift vector ───────────────────────────────────────────────────────
-    print('[5 ] Drift vector ...')
+    print('[5 ] Drift vector ...', flush=True)
     drift = compute_drift_vector(df)
     print(f"      Drift {drift['drift_magnitude_um']:.5f} µm  @ {drift['drift_angle_deg']:.1f}°")
 
     # ── 6. Population heterogeneity ───────────────────────────────────────────
-    print('[6 ] Population heterogeneity ...')
+    print('[6 ] Population heterogeneity ...', flush=True)
     pt_classified, het_stats = compute_population_heterogeneity(pt_df)
     if het_stats:
         print(f"      Slow {het_stats['frac_slow']:.1%}  "
@@ -1362,25 +1477,29 @@ def analyze_file(csv_path, args, root_out):
               f"Hyper {het_stats['frac_hypermotile']:.1%}")
 
     # ── 7. Boundary collisions ────────────────────────────────────────────────
-    print('[7 ] Boundary collisions ...')
-    bc = compute_boundary_collisions(df, px_per_um, bac_r, fps,
-                                     x_lo_um=args.boundary_x_lo,
-                                     x_hi_um=args.boundary_x_hi,
-                                     y_lo_um=args.boundary_y_lo,
-                                     y_hi_um=args.boundary_y_hi)
-    print(f"      {bc['total_events']:,} events  freq = {bc['freq_per_cell_per_s']:.3f} /cell/s")
+    print('[7 ] Boundary collisions ...', flush=True)
+    if roi_verts is not None:
+        bc = compute_polygon_boundary_collisions(df, roi_verts, px_per_um, bac_r, fps)
+        print(f"      {bc['total_events']:,} events  freq = {bc['freq_per_cell_per_s']:.3f} /cell/s  (polygon ROI)")
+    else:
+        bc = compute_boundary_collisions(df, px_per_um, bac_r, fps,
+                                         x_lo_um=args.boundary_x_lo,
+                                         x_hi_um=args.boundary_x_hi,
+                                         y_lo_um=args.boundary_y_lo,
+                                         y_hi_um=args.boundary_y_hi)
+        print(f"      {bc['total_events']:,} events  freq = {bc['freq_per_cell_per_s']:.3f} /cell/s")
 
     # ── 8. Bacteria-bacteria collisions ───────────────────────────────────────
     bb = {'total_events': 'skipped', 'freq_per_cell_per_s': 'skipped', 'events_df': None}
     if not args.skip_bac_bac:
-        print('[8 ] Bacteria-bacteria collisions ...')
+        print('[8 ] Bacteria-bacteria collisions ...', flush=True)
         bb = compute_bac_bac_collisions(df, px_per_um, bac_r, fps)
         print(f"      {bb['total_events']:,} events  freq = {bb['freq_per_cell_per_s']:.3f} /cell/s")
     else:
-        print('[8 ] Bacteria-bacteria collisions ... skipped')
+        print('[8 ] Bacteria-bacteria collisions ... skipped', flush=True)
 
     # ── 9. VACF ───────────────────────────────────────────────────────────────
-    print('[9 ] Velocity autocorrelation function (VACF) ...')
+    print('[9 ] Velocity autocorrelation function (VACF) ...', flush=True)
     vlt, vacf, vn = compute_vacf(df, fps, args.max_lag)
     vacf_zero_cross = None
     if len(vlt) > 0:
@@ -1391,44 +1510,44 @@ def analyze_file(csv_path, args, root_out):
               f"{vacf_zero_cross*1000:.1f} ms" if vacf_zero_cross else "      VACF stays positive (no zero crossing in range)")
 
     # ── 10. Turning angle distribution ────────────────────────────────────────
-    print('[10] Turning angle distribution ...')
+    print('[10] Turning angle distribution ...', flush=True)
     turn_angles = compute_turning_angles(df)
     fwd_bias = float(np.mean(np.abs(turn_angles) < 45)) if len(turn_angles) > 0 else 0.0
     print(f"      {len(turn_angles):,} angles  "
           f"Forward-biased steps (<45°): {fwd_bias:.1%}")
 
     # ── 11. Track curvature ───────────────────────────────────────────────────
-    print('[11] Track curvature ...')
+    print('[11] Track curvature ...', flush=True)
     curv_df = compute_track_curvature(df, fps)
     mean_curv = float(curv_df['mean_curvature_rad_um'].mean()) if not curv_df.empty else 0.0
     print(f"      Mean κ = {mean_curv:.5f} rad/µm")
 
     # ── 12. Confinement ratio ─────────────────────────────────────────────────
-    print('[12] Confinement ratio ...')
+    print('[12] Confinement ratio ...', flush=True)
     cr_df = compute_confinement_ratio(df)
     mean_cr = float(cr_df['confinement_ratio'].mean()) if not cr_df.empty else 0.0
     print(f"      Mean CR = {mean_cr:.4f}  (1=straight, 0=confined)")
 
     # ── 13. Speed–persistence correlation ─────────────────────────────────────
-    print('[13] Speed–persistence correlation ...')
+    print('[13] Speed–persistence correlation ...', flush=True)
     sp_r, sp_p, sp_merged = compute_speed_persistence_corr(pt_df, cr_df)
     if sp_r is not None:
         print(f"      r = {sp_r:.3f}  p = {sp_p:.2e}")
 
     # ── 14. Non-Gaussianity ───────────────────────────────────────────────────
-    print('[14] Non-Gaussianity α₂ ...')
+    print('[14] Non-Gaussianity α₂ ...', flush=True)
     ng_lt, ng_a2 = compute_non_gaussianity(df, fps, args.max_lag)
     ng_peak = float(np.nanmax(ng_a2)) if len(ng_a2) > 0 else 0.0
     print(f"      Peak α₂ = {ng_peak:.4f}")
 
     # ── 15. Active / stationary phases ────────────────────────────────────────
-    print('[15] Active / stationary phase segmentation ...')
+    print('[15] Active / stationary phase segmentation ...', flush=True)
     act_df, act_summary = compute_active_stationary(df, fps, args.stationary_speed)
     if act_summary:
         print(f"      Mean active fraction = {act_summary['mean_frac_active']:.2%}")
 
     # ── 16. Speed–track-length correlation ────────────────────────────────────
-    print('[16] Speed–track-length correlation ...')
+    print('[16] Speed–track-length correlation ...', flush=True)
     stl_r, stl_p = compute_speed_tracklength_corr(pt_df)
     if stl_r is not None:
         print(f"      r = {stl_r:.3f}  p = {stl_p:.2e}")
@@ -1436,22 +1555,22 @@ def analyze_file(csv_path, args, root_out):
     # ── 17. Pair correlation g(r) ─────────────────────────────────────────────
     gr_r = gr_g = None
     if not args.skip_gr:
-        print('[17] Pair correlation function g(r) ...')
+        print('[17] Pair correlation function g(r) ...', flush=True)
         gr_r, gr_g = compute_pair_correlation(df, px_per_um)
         print(f"      g(r) computed over {min(10, df['frame'].nunique())} sample frames")
     else:
-        print('[17] Pair correlation g(r) ... skipped')
+        print('[17] Pair correlation g(r) ... skipped', flush=True)
 
     # ── 18. Spatial velocity correlation ──────────────────────────────────────
-    print('[18] Spatial velocity correlation C_v(r) ...')
+    print('[18] Spatial velocity correlation C_v(r) ...', flush=True)
     cv_r, cv_v = compute_spatial_velocity_corr(df, fps)
 
     # ── 19. Near-wall speed profile ───────────────────────────────────────────
-    print('[19] Near-wall speed profile ...')
+    print('[19] Near-wall speed profile ...', flush=True)
     nw_dist, nw_speed, nw_std = compute_near_wall_speed(df, fps, px_per_um)
 
     # ── Save plots ─────────────────────────────────────────────────────────────
-    print('\n  Saving plots ...')
+    print('\n  Saving plots ...', flush=True)
     ext = _FMT
 
     plot_trajectories(df, out_dir / f'trajectories{ext}',
@@ -1591,18 +1710,22 @@ def analyze_file(csv_path, args, root_out):
         'frac_hypermotile': het_stats.get('frac_hypermotile', None),
         'slow_thresh_um_s': het_stats.get('slow_threshold_um_s',        None),
         'fast_thresh_um_s': het_stats.get('hypermotile_threshold_um_s', None),
-        # boundary
-        'boundary_x_lo_um': round(bnd_x_lo, 3),
-        'boundary_x_hi_um': round(bnd_x_hi, 3),
-        'boundary_y_lo_um': round(bnd_y_lo, 3),
-        'boundary_y_hi_um': round(bnd_y_hi, 3),
-        'boundary_source':  bnd_source,
+        # boundary / ROI
+        'boundary_source':    bnd_source,
+        'roi_n_vertices':     len(roi_verts) if roi_verts is not None else None,
+        'roi_area_um2':       round(roi_area_um2, 3) if roi_area_um2 is not None else None,
+        'roi_unmasked_um2':   round(unmasked_um2, 3) if (roi_verts is not None and unmasked_um2 is not None) else None,
+        'boundary_x_lo_um':   round(bnd_x_lo, 3) if bnd_x_lo is not None else None,
+        'boundary_x_hi_um':   round(bnd_x_hi, 3) if bnd_x_hi is not None else None,
+        'boundary_y_lo_um':   round(bnd_y_lo, 3) if bnd_y_lo is not None else None,
+        'boundary_y_hi_um':   round(bnd_y_hi, 3) if bnd_y_hi is not None else None,
         'boundary_events':          bc['total_events'],
         'boundary_freq_per_cell_s': round(bc['freq_per_cell_per_s'], 4),
-        'boundary_left':   bc['wall_counts'].get('left',   0),
-        'boundary_right':  bc['wall_counts'].get('right',  0),
-        'boundary_top':    bc['wall_counts'].get('top',    0),
-        'boundary_bottom': bc['wall_counts'].get('bottom', 0),
+        'boundary_left':   bc['wall_counts'].get('left',         0),
+        'boundary_right':  bc['wall_counts'].get('right',        0),
+        'boundary_top':    bc['wall_counts'].get('top',          0),
+        'boundary_bottom': bc['wall_counts'].get('bottom',       0),
+        'boundary_polygon_edge': bc['wall_counts'].get('polygon_edge', 0),
         # bac-bac
         'bac_bac_events':          bb['total_events'],
         'bac_bac_freq_per_cell_s': (round(bb['freq_per_cell_per_s'], 4)
@@ -1643,7 +1766,7 @@ def main():
     print('\nBacterial Motility & Collision Analyzer  (19 analyses)')
     print(f'  fps={args.fps}  px/µm={args.px_per_um}  '
           f'min_track={args.min_track_length}  bac_r={args.bac_radius} µm  '
-          f'ep_max={args.ep_max}  output={root_out}')
+          f'ep_max={args.ep_max}  min_mass={args.min_mass}  output={root_out}')
 
     summaries:  list[dict]           = []
     all_speeds: dict[str, pd.Series] = {}
@@ -1666,7 +1789,7 @@ def main():
 
     # ── Cross-file analyses ────────────────────────────────────────────────────
     if len(all_speeds) > 1:
-        print('\n  Running cross-file analyses ...')
+        print('\n  Running cross-file analyses ...', flush=True)
         ext = _FMT
         plot_speed_comparison(all_speeds, root_out / f'speed_comparison{ext}')
         plot_timeseries(s_df, root_out / f'motility_timeseries{ext}')
