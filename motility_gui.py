@@ -46,6 +46,71 @@ GRAPHER    = SCRIPT_DIR / 'graph.py'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Tooltip
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _Tooltip:
+    """Show a multi-line tooltip popup after a short hover delay."""
+
+    _DELAY  = 700   # ms before showing
+    _WRAP   = 420   # pixel wrap width
+
+    def __init__(self, widget, text: str):
+        self._widget  = widget
+        self._text    = text
+        self._win     = None
+        self._after_id = None
+        widget.bind('<Enter>',    self._on_enter,  add='+')
+        widget.bind('<Leave>',    self._on_leave,  add='+')
+        widget.bind('<ButtonPress>', self._on_leave, add='+')
+
+    def _on_enter(self, _event=None):
+        self._cancel()
+        self._after_id = self._widget.after(self._DELAY, self._show)
+
+    def _on_leave(self, _event=None):
+        self._cancel()
+        self._hide()
+
+    def _cancel(self):
+        if self._after_id:
+            self._widget.after_cancel(self._after_id)
+            self._after_id = None
+
+    def _show(self):
+        if self._win:
+            return
+        x = self._widget.winfo_rootx() + 20
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._win = tw = tk.Toplevel(self._widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f'+{x}+{y}')
+        tw.attributes('-topmost', True)
+        # Outer frame for border effect
+        outer = tk.Frame(tw, background='#333333', padx=1, pady=1)
+        outer.pack()
+        tk.Label(
+            outer, text=self._text,
+            justify='left', anchor='w',
+            background='#1e1e2e', foreground='#cdd6f4',
+            font=('TkDefaultFont', 9),
+            wraplength=self._WRAP,
+            padx=10, pady=8,
+        ).pack()
+
+    def _hide(self):
+        if self._win:
+            self._win.destroy()
+            self._win = None
+
+
+def _tip(widget, text: str) -> None:
+    """Attach a tooltip to widget."""
+    _Tooltip(widget, text)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Reusable list-panel widget (used for both folders and CSV files)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -357,19 +422,20 @@ class _ResultsViewer(ttk.Frame):
 
 class _ROIEditor(tk.Toplevel):
     """
-    Opens a frame from the selected image folder and lets the user click to
-    draw a polygonal ROI.
+    Two-phase polygon ROI editor.
 
-    - Left-click         : add vertex
-    - Right-click / Z    : undo last vertex
-    - Double-left-click  : confirm & close
-    - Escape             : cancel
+    Phase 1 — draw:
+      Left-click to add vertices, right-click/Z to undo, double-click or
+      "Tag edges →" to advance to phase 2.
 
-    Stores vertices in the image pixel coordinate space that matches
-    auto_tracking.py (resized to 1232×1028).
+    Phase 2 — tag:
+      Click near any edge to toggle it between Physical (solid red) and
+      Open/image boundary (dashed blue). "Done" calls the callback.
+
+    Callback signature: (vertices_list, img_w, img_h, seg_types_list)
+    Stores vertices in image pixel coords matching auto_tracking.py (1232×1028).
     """
 
-    # Image size used by auto_tracking.py after resize
     _IMG_W, _IMG_H = 1232, 1028
 
     def __init__(self, parent, folder: str | None, px_per_um: float,
@@ -380,37 +446,49 @@ class _ROIEditor(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
 
-        self._px_per_um = px_per_um
-        self._callback  = callback          # called with (vertices_list, img_w, img_h) on confirm
-        self._vertices  = list(existing_verts) if existing_verts else []  # [(x, y) in image px]
-        self._photo     = None              # keep reference to avoid GC
-        self._tmp_png   = None
+        self._px_per_um  = px_per_um
+        self._callback   = callback
+        self._vertices   = list(existing_verts) if existing_verts else []
+        self._seg_types: list[str] = []
+        self._phase      = 1
+        self._photo      = None
+        self._tmp_png    = None
 
-        # ── Canvas size (fit to screen, keep aspect ratio) ────────────────────
+        # ── Canvas size ───────────────────────────────────────────────────────
         scr_w = self.winfo_screenwidth()
         scr_h = self.winfo_screenheight()
         max_cw = max(640, scr_w - 120)
         max_ch = max(480, scr_h - 200)
         scale  = min(max_cw / self._IMG_W, max_ch / self._IMG_H, 1.0)
-        self._cw = int(self._IMG_W * scale)
-        self._ch = int(self._IMG_H * scale)
-        self._scale = scale                 # image_px → canvas_px
+        self._cw    = int(self._IMG_W * scale)
+        self._ch    = int(self._IMG_H * scale)
+        self._scale = scale
 
-        self.geometry(f'{self._cw + 20}x{self._ch + 120}')
+        self.geometry(f'{self._cw + 20}x{self._ch + 140}')
 
-        # ── Toolbar ───────────────────────────────────────────────────────────
-        tf = ttk.Frame(self, padding=(6, 4))
-        tf.pack(fill=tk.X)
-        ttk.Button(tf, text='↩  Undo vertex',  command=self._undo).pack(side=tk.LEFT, padx=3)
-        ttk.Button(tf, text='✕  Clear all',    command=self._clear).pack(side=tk.LEFT, padx=3)
-        ttk.Button(tf, text='✓  Confirm ROI',  command=self._confirm,
+        # ── Phase-1 toolbar ───────────────────────────────────────────────────
+        self._toolbar1 = ttk.Frame(self, padding=(6, 4))
+        self._toolbar1.pack(fill=tk.X)
+        ttk.Button(self._toolbar1, text='↩  Undo vertex', command=self._undo).pack(side=tk.LEFT, padx=3)
+        ttk.Button(self._toolbar1, text='✕  Clear all',   command=self._clear).pack(side=tk.LEFT, padx=3)
+        ttk.Button(self._toolbar1, text='Cancel',         command=self.destroy).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(self._toolbar1, text='Tag edges  →',   command=self._confirm,
                    style='Run.TButton').pack(side=tk.RIGHT, padx=3)
-        ttk.Button(tf, text='Cancel',          command=self.destroy).pack(side=tk.RIGHT, padx=3)
+
+        # ── Phase-2 toolbar (hidden until phase 2) ────────────────────────────
+        self._toolbar2 = ttk.Frame(self, padding=(6, 4))
+        ttk.Button(self._toolbar2, text='←  Back to drawing', command=self._back_to_draw).pack(side=tk.LEFT, padx=3)
+        ttk.Label(self._toolbar2,
+                  text='■ Physical (red)   ╌ ╌ Open/image boundary (blue)   — click edge to toggle',
+                  foreground='#aaaaaa').pack(side=tk.LEFT, padx=10)
+        ttk.Button(self._toolbar2, text='Cancel',    command=self.destroy).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(self._toolbar2, text='✓  Done',   command=self._done_phase2,
+                   style='Run.TButton').pack(side=tk.RIGHT, padx=3)
 
         # ── Canvas ────────────────────────────────────────────────────────────
-        cf = ttk.Frame(self)
-        cf.pack(fill=tk.BOTH, expand=True, padx=6)
-        self._canvas = tk.Canvas(cf, width=self._cw, height=self._ch,
+        self._canvas_frame = ttk.Frame(self)
+        self._canvas_frame.pack(fill=tk.BOTH, expand=True, padx=6)
+        self._canvas = tk.Canvas(self._canvas_frame, width=self._cw, height=self._ch,
                                  bg='#111', cursor='crosshair',
                                  highlightthickness=1, highlightcolor='#555')
         self._canvas.pack()
@@ -422,12 +500,10 @@ class _ROIEditor(tk.Toplevel):
         self.bind('<Escape>', lambda _: self.destroy())
 
         # ── Status bar ────────────────────────────────────────────────────────
-        self._info_var = tk.StringVar(value='No image loaded — click "Confirm ROI" '
-                                      'without an image to use coordinates only.')
+        self._info_var = tk.StringVar(value='No image loaded.')
         ttk.Label(self, textvariable=self._info_var,
                   relief='sunken', anchor='w', padding=(6, 2)).pack(fill=tk.X, padx=6, pady=(2, 6))
 
-        # ── Load background image ─────────────────────────────────────────────
         self._load_frame(folder)
         self._redraw()
 
@@ -446,22 +522,19 @@ class _ROIEditor(tk.Toplevel):
         if img is None:
             self._update_info()
             return
-        img = _cv2.resize(img, (self._IMG_W, self._IMG_H))
-        disp = _cv2.resize(img, (self._cw, self._ch))
-        # Use PIL if available, else temp PNG
+        img  = _cv2.resize(img,  (self._IMG_W, self._IMG_H))
+        disp = _cv2.resize(img,  (self._cw, self._ch))
         if _HAS_PIL:
-            pil_img = _PImage.fromarray(disp)
-            self._photo = _ImageTk.PhotoImage(pil_img)
+            self._photo = _ImageTk.PhotoImage(_PImage.fromarray(disp))
         else:
             self._tmp_png = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
             _cv2.imwrite(self._tmp_png.name, disp)
             self._photo = tk.PhotoImage(file=self._tmp_png.name)
 
-    # ── Drawing ───────────────────────────────────────────────────────────────
+    # ── Phase-1 drawing ───────────────────────────────────────────────────────
 
     def _redraw(self):
         self._canvas.delete('all')
-        # Background image
         if self._photo:
             self._canvas.create_image(0, 0, anchor='nw', image=self._photo)
         else:
@@ -472,19 +545,16 @@ class _ROIEditor(tk.Toplevel):
         if not self._vertices:
             self._update_info()
             return
-        # Draw polygon fill (translucent via stipple)
         cverts = [self._to_canvas(x, y) for x, y in self._vertices]
-        flat = [c for xy in cverts for c in xy]
+        flat   = [c for xy in cverts for c in xy]
         if len(cverts) >= 3:
             self._canvas.create_polygon(flat, fill='#4fc3f7', stipple='gray25',
                                         outline='#29b6f6', width=2)
         elif len(cverts) >= 2:
             self._canvas.create_line(flat, fill='#29b6f6', width=2)
-        # Closing line (dashed) from last to first
         if len(cverts) >= 3:
             self._canvas.create_line(*cverts[-1], *cverts[0],
                                      fill='#29b6f6', width=1, dash=(4, 4))
-        # Vertices
         for i, (cx, cy) in enumerate(cverts):
             r = 5
             color = '#ef5350' if i == 0 else '#fff176'
@@ -494,15 +564,74 @@ class _ROIEditor(tk.Toplevel):
                                      fill='white', font=('TkDefaultFont', 8))
         self._update_info()
 
+    # ── Phase-2 drawing ───────────────────────────────────────────────────────
+
+    def _redraw_phase2(self):
+        self._canvas.delete('all')
+        if self._photo:
+            self._canvas.create_image(0, 0, anchor='nw', image=self._photo)
+        else:
+            self._canvas.create_rectangle(0, 0, self._cw, self._ch, fill='#222')
+
+        n      = len(self._vertices)
+        cverts = [self._to_canvas(x, y) for x, y in self._vertices]
+
+        for i in range(n):
+            x1, y1 = cverts[i]
+            x2, y2 = cverts[(i + 1) % n]
+            stype  = self._seg_types[i]
+            if stype == 'physical':
+                self._canvas.create_line(x1, y1, x2, y2, fill='#ef5350', width=3)
+            else:
+                self._canvas.create_line(x1, y1, x2, y2, fill='#90caf9', width=2, dash=(8, 5))
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            label  = 'P' if stype == 'physical' else 'O'
+            self._canvas.create_text(mx, my - 10, text=label,
+                                     fill='white', font=('TkDefaultFont', 8, 'bold'))
+
+        for cx, cy in cverts:
+            r = 4
+            self._canvas.create_oval(cx-r, cy-r, cx+r, cy+r,
+                                     fill='#bdbdbd', outline='black', width=1)
+
+        n_phys = self._seg_types.count('physical')
+        n_open = self._seg_types.count('open')
+        self._info_var.set(
+            f'{n_phys} Physical (red)  |  {n_open} Open/image boundary (blue dashed)  '
+            f'— click an edge to toggle'
+        )
+
+    # ── Coordinate helpers ────────────────────────────────────────────────────
+
     def _to_canvas(self, ix, iy):
-        """Image pixel → canvas pixel."""
         return ix * self._scale, iy * self._scale
 
     def _to_image(self, cx, cy):
-        """Canvas pixel → image pixel (rounded)."""
         return round(cx / self._scale), round(cy / self._scale)
 
-    # ── Event handlers ────────────────────────────────────────────────────────
+    # ── Edge hit detection ────────────────────────────────────────────────────
+
+    def _hit_segment(self, cx, cy, threshold=12):
+        n      = len(self._vertices)
+        cverts = [self._to_canvas(x, y) for x, y in self._vertices]
+        best_i, best_d = -1, float('inf')
+        for i in range(n):
+            ax, ay = cverts[i]
+            bx, by = cverts[(i + 1) % n]
+            abx, aby = bx - ax, by - ay
+            ab2 = abx*abx + aby*aby
+            if ab2 < 1e-6:
+                d = ((cx - ax)**2 + (cy - ay)**2) ** 0.5
+            else:
+                t   = max(0.0, min(1.0, ((cx - ax)*abx + (cy - ay)*aby) / ab2))
+                px2 = ax + t * abx
+                py2 = ay + t * aby
+                d   = ((cx - px2)**2 + (cy - py2)**2) ** 0.5
+            if d < best_d:
+                best_d, best_i = d, i
+        return best_i if best_d < threshold else -1
+
+    # ── Phase-1 event handlers ────────────────────────────────────────────────
 
     def _on_lclick(self, event):
         ix, iy = self._to_image(event.x, event.y)
@@ -510,51 +639,87 @@ class _ROIEditor(tk.Toplevel):
         self._redraw()
 
     def _on_dbl(self, event):
-        # double-click fires single then double; undo the extra single vertex
         if self._vertices:
             self._vertices.pop()
         self._confirm()
 
     def _undo(self, _event=None):
+        if self._phase != 1:
+            return
         if self._vertices:
             self._vertices.pop()
         self._redraw()
 
     def _clear(self):
+        if self._phase == 2:
+            self._back_to_draw()
         self._vertices.clear()
         self._redraw()
+
+    # ── Phase-2 event handlers ────────────────────────────────────────────────
+
+    def _on_lclick_phase2(self, event):
+        i = self._hit_segment(event.x, event.y)
+        if i >= 0:
+            self._seg_types[i] = 'open' if self._seg_types[i] == 'physical' else 'physical'
+            self._redraw_phase2()
+
+    # ── Phase transitions ─────────────────────────────────────────────────────
 
     def _confirm(self):
         if len(self._vertices) < 3:
             messagebox.showwarning('ROI', 'Draw at least 3 vertices to define a polygon.',
                                    parent=self)
             return
+        self._enter_phase2()
+
+    def _enter_phase2(self):
+        self._phase     = 2
+        self._seg_types = ['physical'] * len(self._vertices)
+        self._toolbar1.pack_forget()
+        self._toolbar2.pack(fill=tk.X, before=self._canvas_frame)
+        self.title('Tag boundary segments — click an edge to toggle Physical / Open')
+        self._canvas.bind('<Button-1>', self._on_lclick_phase2)
+        self._canvas.unbind('<Double-Button-1>')
+        self._canvas.config(cursor='hand2')
+        self._redraw_phase2()
+
+    def _back_to_draw(self):
+        self._phase = 1
+        self._toolbar2.pack_forget()
+        self._toolbar1.pack(fill=tk.X, before=self._canvas_frame)
+        self.title('Draw Polygonal ROI — left-click to add, double-click to confirm')
+        self._canvas.bind('<Button-1>',        self._on_lclick)
+        self._canvas.bind('<Double-Button-1>', self._on_dbl)
+        self._canvas.config(cursor='crosshair')
+        self._redraw()
+
+    def _done_phase2(self):
         if self._callback:
-            self._callback(list(self._vertices), self._IMG_W, self._IMG_H)
+            self._callback(list(self._vertices), self._IMG_W, self._IMG_H,
+                           list(self._seg_types))
         self.destroy()
 
-    # ── Area / info ───────────────────────────────────────────────────────────
+    # ── Area / info (phase 1) ─────────────────────────────────────────────────
 
     def _update_info(self):
         n = len(self._vertices)
         if n == 0:
             self._info_var.set('Click on the image to place polygon vertices.  '
-                               'Right-click or Z to undo.  Double-click to confirm.')
+                               'Right-click or Z to undo.  Double-click or "Tag edges →" to continue.')
             return
         parts = [f'{n} vertices']
         if n >= 3:
-            import math
             verts = self._vertices
-            xs = [v[0] for v in verts]
-            ys = [v[1] for v in verts]
-            n2 = len(verts)
+            xs    = [v[0] for v in verts]
+            ys    = [v[1] for v in verts]
+            n2    = len(verts)
             area_px2 = abs(sum(
                 xs[i]*ys[(i+1)%n2] - xs[(i+1)%n2]*ys[i]
                 for i in range(n2)
             )) / 2
-            area_um2 = area_px2 / (self._px_per_um ** 2)
-            total_px2 = self._IMG_W * self._IMG_H
-            total_um2 = total_px2 / (self._px_per_um ** 2)
+            area_um2  = area_px2 / (self._px_per_um ** 2)
+            total_um2 = (self._IMG_W * self._IMG_H) / (self._px_per_um ** 2)
             unmasked  = total_um2 - area_um2
             parts.append(f'Masked (ROI) area = {area_um2:,.1f} µm²')
             parts.append(f'Unmasked area = {unmasked:,.1f} µm²')
@@ -746,6 +911,7 @@ class _ParamTuner(tk.Toplevel):
         self._frame_slider.configure(to=max(0, n - 1))
         self._frame_lbl.config(text=f'1 / {n}')
         self._status_var.set(f'Loaded {n} frames.  Running detection…')
+        self._draw_overlay()
         self._schedule_detect()
 
     # ── Parameter change handlers ─────────────────────────────────────────────
@@ -796,9 +962,10 @@ class _ParamTuner(tk.Toplevel):
             import warnings
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore')
-                feats = tp.locate(frame, diameter=diam, minmass=mass, processes=1)
+                feats = tp.locate(frame, diameter=diam, minmass=mass)
         except Exception as exc:
-            self.after(0, lambda: self._status_var.set(f'Detection error: {exc}'))
+            msg = str(exc)
+            self.after(0, lambda m=msg: self._status_var.set(f'Detection error: {m}'))
             return
         self.after(0, lambda f=feats, d=diam, m=mass:
                    self._on_detect_done(f, d, m))
@@ -833,44 +1000,47 @@ class _ParamTuner(tk.Toplevel):
                 self._canvas_msg('PIL/Pillow not available — cannot display overlay')
             return
 
-        frame = self._frames[self._frame_idx]
-        img   = _PImage.fromarray(frame).convert('RGB')
-        draw  = _PImageDraw.Draw(img, 'RGBA')
-
-        if self._detections is not None and len(self._detections) > 0:
-            diam = int(self._diam.get())
-            r    = diam / 2.0
-            df   = self._detections
-            m_lo = float(df['mass'].min())
-            m_hi = float(df['mass'].max())
-            span = max(m_hi - m_lo, 1.0)
-
-            for _, row in df.iterrows():
-                x, y = float(row['x']), float(row['y'])
-                t    = (float(row['mass']) - m_lo) / span   # 0=dim, 1=bright
-                # Cyan: dim → (0,160,200), bright → (0,255,255)
-                g = int(160 + 95 * t)
-                b = int(200 + 55 * t)
-                color = (0, g, b)
-                # Filled semi-transparent circle
-                draw.ellipse([x-r, y-r, x+r, y+r],
-                             fill=(0, g, b, 50), outline=color, width=2)
-                # Yellow centroid dot
-                draw.ellipse([x-2, y-2, x+2, y+2], fill=(255, 220, 0))
-
-        # Scale to canvas size
-        cw = max(self._canvas.winfo_width(),  100)
-        ch = max(self._canvas.winfo_height(), 100)
-        scale = min(cw / img.width, ch / img.height)
-        w = max(1, int(img.width  * scale))
-        h = max(1, int(img.height * scale))
         try:
-            resamp = _PImage.Resampling.LANCZOS
-        except AttributeError:
-            resamp = _PImage.LANCZOS  # type: ignore[attr-defined]
-        self._photo = _ImageTk.PhotoImage(img.resize((w, h), resamp))
-        self._canvas.delete('all')
-        self._canvas.create_image(0, 0, anchor='nw', image=self._photo)
+            frame = self._frames[self._frame_idx]
+            base  = _PImage.fromarray(frame).convert('RGB')
+
+            if self._detections is not None and len(self._detections) > 0:
+                overlay = _PImage.new('RGBA', base.size, (0, 0, 0, 0))
+                draw    = _PImageDraw.Draw(overlay)
+                diam = int(self._diam.get())
+                r    = diam / 2.0
+                df   = self._detections
+                m_lo = float(df['mass'].min())
+                m_hi = float(df['mass'].max())
+                span = max(m_hi - m_lo, 1.0)
+
+                for _, row in df.iterrows():
+                    x, y = float(row['x']), float(row['y'])
+                    t    = (float(row['mass']) - m_lo) / span
+                    g = int(160 + 95 * t)
+                    b = int(200 + 55 * t)
+                    draw.ellipse([x-r, y-r, x+r, y+r],
+                                 fill=(0, g, b, 60), outline=(0, g, b, 220), width=2)
+                    draw.ellipse([x-2, y-2, x+2, y+2], fill=(255, 220, 0, 255))
+
+                img = _PImage.alpha_composite(base.convert('RGBA'), overlay).convert('RGB')
+            else:
+                img = base
+
+            cw = max(self._canvas.winfo_width(),  100)
+            ch = max(self._canvas.winfo_height(), 100)
+            scale = min(cw / img.width, ch / img.height)
+            w = max(1, int(img.width  * scale))
+            h = max(1, int(img.height * scale))
+            try:
+                resamp = _PImage.Resampling.LANCZOS
+            except AttributeError:
+                resamp = _PImage.LANCZOS  # type: ignore[attr-defined]
+            self._photo = _ImageTk.PhotoImage(img.resize((w, h), resamp))
+            self._canvas.delete('all')
+            self._canvas.create_image(0, 0, anchor='nw', image=self._photo)
+        except Exception as exc:
+            self._canvas_msg(f'Display error:\n{exc}')
 
     def _canvas_msg(self, text: str):
         self._canvas.delete('all')
@@ -910,7 +1080,8 @@ class MotilityGUI(tk.Tk):
         self._files:   list[str] = []   # analysis-only mode
 
         # ROI polygon state (pipeline mode)
-        self._roi_vertices: list[tuple[int, int]] = []  # [(x, y) in image px]
+        self._roi_vertices:  list[tuple[int, int]] = []
+        self._roi_seg_types: list[str] = []
         self._roi_img_w: int = _ROIEditor._IMG_W
         self._roi_img_h: int = _ROIEditor._IMG_H
 
@@ -1013,17 +1184,55 @@ class MotilityGUI(tk.Tk):
     def _build_tracking_tab(self, p):
         p.columnconfigure(2, weight=1)
         self.pixel_size_var   = self._param_row(p, 0, 'Pixel size (µm/px)', tk.DoubleVar, 0.349,
-                                                 'µm per pixel after resize  (1 / px_per_µm)')
+            'µm per pixel after resize  (1 / px_per_µm)',
+            'Spatial calibration — converts pixel distances to micrometres.\n\n'
+            'Too small → speeds, MSD diffusion coefficient D, and run lengths are all overestimated.\n'
+            'Too large → all distances are underestimated.\n\n'
+            'Affects every metric with a µm unit: swimming speed, D, persistence length, run length, '
+            'and boundary collision distance.')
         self.trk_fps_var      = self._param_row(p, 1, 'FPS',                tk.DoubleVar, 10.0,
-                                                 'Camera frame rate')
+            'Camera frame rate',
+            'Camera frame rate — converts frame counts to time.\n\n'
+            'Too low → apparent speeds are underestimated (cells move further per "frame" than assumed).\n'
+            'Too high → speeds overestimated.\n\n'
+            'Affects: swimming speed (µm/s), diffusion coefficient D (µm²/s), tumble frequency (/s), '
+            'VACF zero-crossing time, and boundary collision frequency (/cell/s).')
         self.diameter_var     = self._param_row(p, 2, 'Feature diameter (px)', tk.IntVar,  9,
-                                                 'Must be odd; ~apparent cell size in pixels')
+            'Must be odd; ~apparent cell size in pixels',
+            'Apparent width of one bacterium in pixels. Must be an odd integer.\n\n'
+            'Too small → one cell splits into multiple detections; inflates cell count and creates '
+            'ghost tracks with near-zero speed.\n'
+            'Too large → background noise and debris are detected as cells; raises false track count '
+            'and lowers mean mass.\n\n'
+            'Affects: number of detected tracks, mean swimming speed (ghost tracks bias it low), '
+            'MSD short-lag slope (noise inflates apparent diffusion).')
         self.trk_minmass_var  = self._param_row(p, 3, 'Min mass',           tk.DoubleVar, 200.0,
-                                                 'Min integrated brightness — raise to reject background')
+            'Min integrated brightness — raise to reject background',
+            'Minimum integrated brightness of a detected spot.\n\n'
+            'Too low → dim background particles are tracked; many short, slow ghost tracks appear; '
+            'mean speed drops; non-Gaussianity α₂ rises spuriously.\n'
+            'Too high → genuine dim or slow bacteria are missed; population is biased toward '
+            'fast and bright cells only.\n\n'
+            'Affects: cell count, speed distribution, subpopulation fractions (slow/normal/hyper), '
+            'and track length distribution.')
         self.search_range_var = self._param_row(p, 4, 'Search range (px)',  tk.IntVar,    8,
-                                                 'Max displacement between frames to link same cell')
+            'Max displacement between frames to link same cell',
+            'Maximum pixel displacement a cell may travel between consecutive frames '
+            'to be linked into the same track.\n\n'
+            'Too small → fast-moving cells break into many short tracks; mean track length falls; '
+            'run-and-tumble and MSD statistics become unreliable.\n'
+            'Too large → nearby cells swap identities; spurious long-range links create '
+            'artificially fast phantom tracks.\n\n'
+            'Affects: track length, swimming speed, run length, MSD α, directional persistence.')
         self.memory_var       = self._param_row(p, 5, 'Memory (frames)',    tk.IntVar,    3,
-                                                 'Frames a cell may vanish and still be re-linked')
+            'Frames a cell may vanish and still be re-linked',
+            'How many consecutive frames a cell may be missing (e.g. out of focus) '
+            'and still be re-linked to the same track.\n\n'
+            'Higher → longer tracks, but increased risk of merging two different bacteria '
+            'that pass near the same location.\n'
+            'Lower → tracks break at brief occlusions, shortening mean track length and '
+            'reducing MSD reliability at longer lags.\n\n'
+            'Affects: track length, confinement ratio, MSD long-lag behaviour.')
 
         ttk.Separator(p, orient='horizontal').grid(
             row=6, column=0, columnspan=3, sticky='ew', pady=8)
@@ -1038,22 +1247,69 @@ class MotilityGUI(tk.Tk):
     def _build_pl_analysis_tab(self, p):
         p.columnconfigure(2, weight=1)
         self.pl_min_trk_var = self._param_row(p, 0, 'Min track length',    tk.IntVar,    10,
-                                               'Frames — shorter tracks excluded')
+            'Frames — shorter tracks excluded',
+            'Minimum number of frames a track must span to be included in analysis.\n\n'
+            'Too low → very short tracks dominate; MSD and autocorrelation are unreliable; '
+            'run-and-tumble counts are noisy because there are too few steps per track.\n'
+            'Too high → sample size shrinks; slow or boundary-colliding bacteria (which tend '
+            'to have shorter tracks) are disproportionately excluded.\n\n'
+            'Affects: all 19 metrics — effectively sets the minimum data quality floor.')
         self.pl_ep_var      = self._param_row(p, 1, 'ep max',              tk.DoubleVar, 1.0,
-                                               'Max |ep| localisation error to keep')
+            'Max |ep| localisation error to keep',
+            'Maximum localisation uncertainty (|ep|) reported by trackpy for a detection.\n\n'
+            'Too high → noisy localisations are included; apparent speed and short-lag MSD '
+            'are artificially inflated; non-Gaussianity α₂ rises spuriously.\n'
+            'Too low → over-strict filtering removes valid detections in dim frames, '
+            'reducing sample size.\n\n'
+            'Affects: speed distribution variance, MSD short-lag slope, non-Gaussianity α₂.')
         self.pl_min_mass_var= self._param_row(p, 2, 'Min mass (post-track)',tk.DoubleVar, 0.0,
-                                               'Extra brightness filter after tracking (0 = off)')
+            'Extra brightness filter after tracking (0 = off)',
+            'Secondary brightness filter applied after tracking is complete. Set to 0 to disable.\n\n'
+            'Raise if dim non-bacterial particles survived the tracking step. '
+            'Useful when background fluorescence varies across frames or timepoints.\n\n'
+            'Affects: same as pre-tracking Min mass — cell count, speed distribution, '
+            'subpopulation fractions (slow/normal/hyper-motile).')
         self.pl_bac_r_var   = self._param_row(p, 3, 'Bacterium radius (µm)',tk.DoubleVar, 0.5,
-                                               'Used for collision distance thresholds')
+            'Used for collision distance thresholds',
+            'Physical radius of one bacterium (half the cell width).\n\n'
+            'Too large → boundary and cell–cell collision frequencies are overestimated; '
+            'the near-wall speed profile includes cells further from the wall than intended.\n'
+            'Too small → genuine wall contacts and cell–cell interactions are missed; '
+            'collision frequency is underestimated.\n\n'
+            'Affects: boundary collision frequency (#7), bacteria–bacteria collision '
+            'frequency (#8), near-wall speed profile (#19).')
 
     def _build_pl_adv_tab(self, p):
         p.columnconfigure(2, weight=1)
         self.pl_tumble_var  = self._param_row(p, 0, 'Tumble angle (°)',     tk.DoubleVar, 90.0,
-                                               'Direction change above this → tumble')
+            'Direction change above this → tumble',
+            'A direction change larger than this angle in a single step is classified as a tumble.\n\n'
+            'Lower threshold → more steps classified as tumbles; tumble frequency rises and '
+            'mean run length shortens; run-and-tumble fractions shift toward tumbling.\n'
+            'Higher threshold → only sharp reversals counted; smooth curving motion is '
+            'classified as part of a run.\n\n'
+            'Affects: tumble frequency, run length, tumble fraction, run-and-tumble '
+            'subpopulation split (#4).')
         self.pl_maxlag_var  = self._param_row(p, 1, 'Max lag (frames)',     tk.IntVar,    20,
-                                               'Maximum lag for MSD / autocorrelation')
+            'Maximum lag for MSD / autocorrelation',
+            'Upper bound of the lag-time range used when computing MSD and '
+            'velocity/direction autocorrelation curves.\n\n'
+            'Too low → the diffusion exponent α may not converge; persistence time τ_p '
+            'might be cut off before its true value.\n'
+            'Too high → few track pairs contribute at long lags; curves become noisy '
+            'and unreliable at the tail.\n\n'
+            'Rule of thumb: set to ≤ ¼ of the shortest accepted track length.\n\n'
+            'Affects: MSD (#2) — D and α; directional autocorrelation (#3) — τ_p and '
+            'persistence length; VACF (#9); non-Gaussianity α₂ (#14).')
         self.pl_statsp_var  = self._param_row(p, 2, 'Stationary speed (µm/s)', tk.DoubleVar, 0.5,
-                                               'Steps below this → stationary')
+            'Steps below this → stationary',
+            'Steps with instantaneous speed below this threshold are classified as stationary phases.\n\n'
+            'Too low → genuinely slow swimming is classified as stationary; active fraction '
+            'is artificially elevated.\n'
+            'Too high → all bacteria appear partially stationary; active fraction drops '
+            'and mean active-phase speed rises.\n\n'
+            'Affects: active/stationary phase analysis (#15) — active fraction, mean active '
+            'speed, and stationary cell subpopulation count.')
         ttk.Separator(p, orient='horizontal').grid(
             row=3, column=0, columnspan=3, sticky='ew', pady=8)
         self.pl_skip_bac_var = tk.BooleanVar(value=False)
@@ -1109,10 +1365,11 @@ class MotilityGUI(tk.Tk):
         folder = self._folders[0] if self._folders else None
         px_per_um = self.pixel_size_var.get()
 
-        def _on_confirm(verts, img_w, img_h):
-            self._roi_vertices = verts
-            self._roi_img_w    = img_w
-            self._roi_img_h    = img_h
+        def _on_confirm(verts, img_w, img_h, seg_types=None):
+            self._roi_vertices  = verts
+            self._roi_seg_types = seg_types if seg_types is not None else ['physical'] * len(verts)
+            self._roi_img_w     = img_w
+            self._roi_img_h     = img_h
             self._refresh_roi_info()
 
         _ROIEditor(self, folder, px_per_um,
@@ -1120,7 +1377,8 @@ class MotilityGUI(tk.Tk):
                    callback=_on_confirm)
 
     def _clear_roi(self):
-        self._roi_vertices = []
+        self._roi_vertices  = []
+        self._roi_seg_types = []
         self._refresh_roi_info()
 
     def _refresh_roi_info(self):
@@ -1137,10 +1395,15 @@ class MotilityGUI(tk.Tk):
         area_um2    = area_px2 / (px_per_um ** 2)
         total_um2   = (self._roi_img_w * self._roi_img_h) / (px_per_um ** 2)
         unmasked_um2 = total_um2 - area_um2
+        seg_info = ''
+        if self._roi_seg_types:
+            n_phys = self._roi_seg_types.count('physical')
+            n_open = self._roi_seg_types.count('open')
+            seg_info = f'  |  {n_phys} physical / {n_open} open segments'
         self._roi_info_var.set(
             f'{n} vertices  |  Masked (ROI) area: {area_um2:,.1f} µm²  |  '
             f'Unmasked area: {unmasked_um2:,.1f} µm²  '
-            f'({area_um2/total_um2:.1%} of image)'
+            f'({area_um2/total_um2:.1%} of image){seg_info}'
         )
 
     # ── Analysis-only tab ─────────────────────────────────────────────────────
@@ -1176,26 +1439,77 @@ class MotilityGUI(tk.Tk):
     def _build_basic_tab(self, p):
         p.columnconfigure(2, weight=1)
         self.fps_var      = self._param_row(p, 0, 'FPS',                 tk.DoubleVar, 50.0,
-                                             'Camera frame rate (frames per second)')
+            'Camera frame rate (frames per second)',
+            'Camera frame rate — converts frame counts to time.\n\n'
+            'Too low → apparent speeds are underestimated.\n'
+            'Too high → speeds overestimated.\n\n'
+            'Affects: swimming speed (µm/s), diffusion coefficient D (µm²/s), '
+            'tumble frequency (/s), VACF zero-crossing time, boundary collision frequency (/cell/s).')
         self.px_var       = self._param_row(p, 1, 'Pixels / µm',        tk.DoubleVar, 50.0,
-                                             'Spatial calibration  (50 px/µm → 1 px = 20 nm)')
+            'Spatial calibration  (50 px/µm → 1 px = 20 nm)',
+            'Spatial calibration — converts pixel distances to micrometres.\n\n'
+            'Too small → speeds, MSD diffusion coefficient D, and run lengths are overestimated.\n'
+            'Too large → all distances are underestimated.\n\n'
+            'Affects every metric with a µm unit: swimming speed, D, persistence length, '
+            'run length, and boundary collision distance.')
         self.min_trk_var  = self._param_row(p, 2, 'Min track length',   tk.IntVar,    10,
-                                             'Frames — tracks shorter than this are excluded')
+            'Frames — tracks shorter than this are excluded',
+            'Minimum number of frames a track must span to be included in analysis.\n\n'
+            'Too low → short tracks dominate; MSD and autocorrelation are unreliable; '
+            'run-and-tumble counts are noisy.\n'
+            'Too high → sample size shrinks; slow or boundary-colliding bacteria '
+            '(which have shorter tracks) are disproportionately excluded.\n\n'
+            'Affects: all 19 metrics — effectively sets the minimum data quality floor.')
         self.ep_var       = self._param_row(p, 3, 'ep max',             tk.DoubleVar, 1.0,
-                                             'Max localisation error |ep| to keep')
+            'Max localisation error |ep| to keep',
+            'Maximum localisation uncertainty (|ep|) reported by trackpy for a detection.\n\n'
+            'Too high → noisy localisations are included; apparent speed and short-lag MSD '
+            'are artificially inflated; non-Gaussianity α₂ rises spuriously.\n'
+            'Too low → valid detections in dim frames are removed, reducing sample size.\n\n'
+            'Affects: speed distribution variance, MSD short-lag slope, non-Gaussianity α₂.')
         self.min_mass_var = self._param_row(p, 4, 'Min mass',           tk.DoubleVar, 0.0,
-                                             'Min integrated intensity; raise to reject dim background (0 = off)')
+            'Min integrated intensity; raise to reject dim background (0 = off)',
+            'Minimum integrated brightness filter (0 = disabled).\n\n'
+            'Raise if dim non-bacterial particles are present in the tracking CSV.\n\n'
+            'Affects: cell count, speed distribution, subpopulation fractions (slow/normal/hyper-motile).')
         self.bac_r_var    = self._param_row(p, 5, 'Bacterium radius (µm)', tk.DoubleVar, 0.5,
-                                             'Half-width used for collision distance thresholds')
+            'Half-width used for collision distance thresholds',
+            'Physical radius of one bacterium (half the cell width).\n\n'
+            'Too large → boundary and cell–cell collision frequencies are overestimated; '
+            'near-wall speed profile includes cells further from the wall than intended.\n'
+            'Too small → genuine wall contacts and cell–cell interactions are missed.\n\n'
+            'Affects: boundary collision frequency (#7), bacteria–bacteria collision '
+            'frequency (#8), near-wall speed profile (#19).')
 
     def _build_adv_tab(self, p):
         p.columnconfigure(2, weight=1)
         self.tumble_var  = self._param_row(p, 0, 'Tumble angle (°)',      tk.DoubleVar, 90.0,
-                                            'Direction change above this → classified as tumble')
+            'Direction change above this → classified as tumble',
+            'A direction change larger than this angle in a single step is classified as a tumble.\n\n'
+            'Lower threshold → more steps classified as tumbles; tumble frequency rises and '
+            'mean run length shortens.\n'
+            'Higher threshold → only sharp reversals counted; smooth curving motion '
+            'is classified as part of a run.\n\n'
+            'Affects: tumble frequency, run length, tumble fraction, run-and-tumble '
+            'subpopulation split (#4).')
         self.max_lag_var = self._param_row(p, 1, 'Max lag (frames)',      tk.IntVar,    20,
-                                            'Maximum lag computed for MSD and autocorrelation')
+            'Maximum lag computed for MSD and autocorrelation',
+            'Upper bound of the lag-time range for MSD and autocorrelation curves.\n\n'
+            'Too low → diffusion exponent α may not converge; persistence time τ_p '
+            'might be cut off before its true value.\n'
+            'Too high → few track pairs contribute at long lags; curves become noisy.\n\n'
+            'Rule of thumb: set to ≤ ¼ of the shortest accepted track length.\n\n'
+            'Affects: MSD (#2) — D and α; directional autocorrelation (#3) — τ_p; '
+            'VACF (#9); non-Gaussianity α₂ (#14).')
         self.stat_sp_var = self._param_row(p, 2, 'Stationary speed (µm/s)', tk.DoubleVar, 0.5,
-                                            'Steps slower than this → classified as stationary')
+            'Steps slower than this → classified as stationary',
+            'Steps with instantaneous speed below this threshold are classified as stationary phases.\n\n'
+            'Too low → slow swimming is classified as stationary; active fraction is '
+            'artificially elevated.\n'
+            'Too high → all bacteria appear partially stationary; active fraction drops '
+            'and mean active-phase speed rises.\n\n'
+            'Affects: active/stationary phase analysis (#15) — active fraction, mean '
+            'active speed, stationary cell subpopulation count.')
         ttk.Separator(p, orient='horizontal').grid(
             row=3, column=0, columnspan=3, sticky='ew', pady=8)
         ttk.Label(p, text='Arena boundaries  (leave empty → auto-detect from data)',
@@ -1295,16 +1609,19 @@ class MotilityGUI(tk.Tk):
 
     # ── Helper: parameter row ─────────────────────────────────────────────────
 
-    def _param_row(self, parent, row, label, vtype, default, hint=''):
-        ttk.Label(parent, text=label).grid(
-            row=row, column=0, sticky='w', padx=(0, 12), pady=4)
+    def _param_row(self, parent, row, label, vtype, default, hint='', tooltip=''):
+        lbl = ttk.Label(parent, text=label)
+        lbl.grid(row=row, column=0, sticky='w', padx=(0, 12), pady=4)
         var = vtype(value=default)
-        ttk.Entry(parent, textvariable=var, width=12).grid(
-            row=row, column=1, sticky='w', pady=4)
+        ent = ttk.Entry(parent, textvariable=var, width=12)
+        ent.grid(row=row, column=1, sticky='w', pady=4)
         if hint:
             ttk.Label(parent, text=hint, foreground='grey',
                       font=('TkDefaultFont', 8)).grid(
                 row=row, column=2, sticky='w', padx=(10, 0))
+        if tooltip:
+            _tip(lbl, tooltip)
+            _tip(ent, tooltip)
         return var
 
     # ── Folder management (pipeline) ──────────────────────────────────────────
@@ -1458,9 +1775,10 @@ class MotilityGUI(tk.Tk):
             roi_file = str(out_base / 'roi_polygon.json')
             with open(roi_file, 'w') as f:
                 json.dump({
-                    'vertices': [list(v) for v in self._roi_vertices],
-                    'image_w':  self._roi_img_w,
-                    'image_h':  self._roi_img_h,
+                    'vertices':      [list(v) for v in self._roi_vertices],
+                    'segment_types': self._roi_seg_types,
+                    'image_w':       self._roi_img_w,
+                    'image_h':       self._roi_img_h,
                 }, f, indent=2)
 
         # --- analysis step (all CSVs together) ---

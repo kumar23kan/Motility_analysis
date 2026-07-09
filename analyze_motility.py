@@ -132,13 +132,14 @@ def parse_args():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_roi_polygon(path):
-    """Load ROI from JSON. Returns (vertices_px np.ndarray shape (N,2), image_w, image_h) or None."""
+    """Load ROI from JSON. Returns (vertices_px, image_w, image_h, segment_types) or None."""
     if path is None:
         return None
     with open(path) as f:
         data = json.load(f)
-    verts = np.array(data['vertices'], dtype=float)  # (N, 2) in pixel coords
-    return verts, data.get('image_w'), data.get('image_h')
+    verts     = np.array(data['vertices'], dtype=float)
+    seg_types = data.get('segment_types', ['physical'] * len(verts))
+    return verts, data.get('image_w'), data.get('image_h'), seg_types
 
 
 def _polygon_area_um2(vertices_px, px_per_um):
@@ -156,13 +157,18 @@ def apply_roi_mask(df, vertices_px):
     return df[inside].copy(), df[~inside].copy()
 
 
-def compute_polygon_boundary_collisions(df, vertices_px, px_per_um, bac_radius_um, fps):
-    """Detect detections within bac_radius of any polygon edge."""
+def compute_polygon_boundary_collisions(df, vertices_px, px_per_um, bac_radius_um, fps,
+                                        segment_types=None):
+    """Detect detections within bac_radius of physical polygon edges only."""
     r_px = bac_radius_um * px_per_um
-    pts = df[['x', 'y']].values.astype(float)
-    n = len(vertices_px)
+    pts  = df[['x', 'y']].values.astype(float)
+    n    = len(vertices_px)
+    if segment_types is None:
+        segment_types = ['physical'] * n
     min_dists = np.full(len(pts), np.inf)
     for i in range(n):
+        if segment_types[i] != 'physical':
+            continue
         A = vertices_px[i].astype(float)
         B = vertices_px[(i + 1) % n].astype(float)
         AB = B - A
@@ -1373,13 +1379,14 @@ def analyze_file(csv_path, args, root_out):
     print(f'{"=" * 64}', flush=True)
 
     # Load ROI polygon if specified
-    roi_verts = None
+    roi_verts    = None
+    roi_seg_types = None
     roi_area_um2 = None
     image_w = image_h = None
     if args.roi_polygon_file:
         result = load_roi_polygon(args.roi_polygon_file)
         if result is not None:
-            roi_verts, image_w, image_h = result
+            roi_verts, image_w, image_h, roi_seg_types = result
 
     df_raw = load_and_filter(csv_path, args.min_track_length, args.ep_max,
                              args.min_mass, roi_vertices=roi_verts)
@@ -1479,8 +1486,10 @@ def analyze_file(csv_path, args, root_out):
     # ── 7. Boundary collisions ────────────────────────────────────────────────
     print('[7 ] Boundary collisions ...', flush=True)
     if roi_verts is not None:
-        bc = compute_polygon_boundary_collisions(df, roi_verts, px_per_um, bac_r, fps)
-        print(f"      {bc['total_events']:,} events  freq = {bc['freq_per_cell_per_s']:.3f} /cell/s  (polygon ROI)")
+        bc = compute_polygon_boundary_collisions(df, roi_verts, px_per_um, bac_r, fps, roi_seg_types)
+        n_phys = sum(1 for s in (roi_seg_types or []) if s == 'physical')
+        print(f"      {bc['total_events']:,} events  freq = {bc['freq_per_cell_per_s']:.3f} /cell/s  "
+              f"({n_phys}/{len(roi_verts)} physical segments)")
     else:
         bc = compute_boundary_collisions(df, px_per_um, bac_r, fps,
                                          x_lo_um=args.boundary_x_lo,
