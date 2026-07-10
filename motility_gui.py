@@ -1070,8 +1070,8 @@ class MotilityGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Bacterial Motility Analyzer')
-        self.geometry('1220x860')
-        self.minsize(960, 680)
+        self.geometry('1220x800')
+        self.minsize(960, 620)
 
         self._apply_style()
 
@@ -1533,36 +1533,19 @@ class MotilityGUI(tk.Tk):
     # ── Shared bottom (output folder + log + controls) ────────────────────────
 
     def _build_bottom(self, parent):
-        # Output folder  (out_var already created in __init__)
-        olf = ttk.LabelFrame(parent, text=' Output Folder ', padding=(8, 5))
-        olf.pack(fill=tk.X, padx=8, pady=(4, 0))
-        ttk.Entry(olf, textvariable=self.out_var,
-                  font=('TkFixedFont', 9)).pack(side=tk.LEFT, fill=tk.X,
-                                                 expand=True, padx=(0, 6))
-        ttk.Button(olf, text='Browse…', command=self._browse_out).pack(side=tk.LEFT)
+        # Pack fixed-height controls at the BOTTOM first so they are always
+        # visible even on small/high-DPI Windows screens where the window may
+        # not fit the full design height.
 
-        # Log
-        llf = ttk.LabelFrame(parent, text=' Log ', padding=(5, 5))
-        llf.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 0))
-        self.log = scrolledtext.ScrolledText(
-            llf, font=('TkFixedFont', 9),
-            bg='#1e1e1e', fg='#d4d4d4', insertbackground='white',
-            state=tk.DISABLED, wrap=tk.NONE, height=14,
-        )
-        self.log.pack(fill=tk.BOTH, expand=True)
-        self.log.tag_config('err', foreground='#f48771')
-        self.log.tag_config('ok',  foreground='#89d185')
-        self.log.tag_config('hdr', foreground='#569cd6')
-        self.log.tag_config('dim', foreground='#888888')
-        self.log.tag_config('sep', foreground='#c586c0')
+        # Status bar (very bottom)
+        self.status_var = tk.StringVar(value='Ready.')
+        ttk.Label(parent, textvariable=self.status_var,
+                  relief='sunken', anchor='w',
+                  padding=(6, 2)).pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(2, 6))
 
-        # Progress
-        self.progress = ttk.Progressbar(parent, mode='indeterminate')
-        self.progress.pack(fill=tk.X, padx=8, pady=(4, 0))
-
-        # Buttons
+        # Buttons (above status bar)
         bf = ttk.Frame(parent, padding=(8, 4))
-        bf.pack(fill=tk.X)
+        bf.pack(side=tk.BOTTOM, fill=tk.X)
 
         self.run_btn = ttk.Button(bf, text='▶   Run Full Pipeline',
                                    command=self._run, style='Run.TButton')
@@ -1578,11 +1561,32 @@ class MotilityGUI(tk.Tk):
         ttk.Button(bf, text='Clear Log',
                    command=self._clear_log).pack(side=tk.RIGHT)
 
-        # Status bar
-        self.status_var = tk.StringVar(value='Ready.')
-        ttk.Label(parent, textvariable=self.status_var,
-                  relief='sunken', anchor='w',
-                  padding=(6, 2)).pack(fill=tk.X, padx=8, pady=(2, 6))
+        # Progress bar (above buttons)
+        self.progress = ttk.Progressbar(parent, mode='indeterminate')
+        self.progress.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(4, 0))
+
+        # Output folder (top of bottom section)
+        olf = ttk.LabelFrame(parent, text=' Output Folder ', padding=(8, 5))
+        olf.pack(fill=tk.X, padx=8, pady=(4, 0))
+        ttk.Entry(olf, textvariable=self.out_var,
+                  font=('TkFixedFont', 9)).pack(side=tk.LEFT, fill=tk.X,
+                                                 expand=True, padx=(0, 6))
+        ttk.Button(olf, text='Browse…', command=self._browse_out).pack(side=tk.LEFT)
+
+        # Log fills remaining space between output folder and buttons
+        llf = ttk.LabelFrame(parent, text=' Log ', padding=(5, 5))
+        llf.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 0))
+        self.log = scrolledtext.ScrolledText(
+            llf, font=('TkFixedFont', 9),
+            bg='#1e1e1e', fg='#d4d4d4', insertbackground='white',
+            state=tk.DISABLED, wrap=tk.NONE, height=8,
+        )
+        self.log.pack(fill=tk.BOTH, expand=True)
+        self.log.tag_config('err', foreground='#f48771')
+        self.log.tag_config('ok',  foreground='#89d185')
+        self.log.tag_config('hdr', foreground='#569cd6')
+        self.log.tag_config('dim', foreground='#888888')
+        self.log.tag_config('sep', foreground='#c586c0')
 
     # ── Mode switch ───────────────────────────────────────────────────────────
 
