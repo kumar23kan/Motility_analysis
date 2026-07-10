@@ -1,7 +1,7 @@
 # Bacterial Motility Analysis Tool
 
 End-to-end pipeline for tracking and analysing bacterial motility from TIFF microscopy images.
-Produces 19 motility metrics per timepoint plus cross-timepoint statistical comparisons.
+Produces 25 motility metrics per timepoint plus cross-timepoint statistical comparisons.
 
 ---
 
@@ -70,6 +70,7 @@ Output appears in the configured output folder (default: `output/`).
 | Tumble angle (°) | 90 | Direction change above this → classified as tumble |
 | Max lag (frames) | 20 | Maximum lag for MSD and autocorrelation |
 | Stationary speed (µm/s) | 0.5 | Steps slower than this → classified as stationary |
+| G-force axis (°) | 90 | Direction of G-force in image coordinates — degrees clockwise from +X (right). 90 = downward (+Y), the default for a horizontally-mounted microscope with gravity pointing down. Used only by the gravitaxis analysis (#21). |
 
 ### 📊 Analysis Only
 
@@ -151,6 +152,9 @@ python3 analyze_motility.py output/20_min/tracking_20_min.csv \
 
 # Skip slow steps on large datasets
 python3 analyze_motility.py tracking.csv --skip-bac-bac --skip-gr
+
+# Set G-force direction (e.g. centrifuge oriented to the right = 0°)
+python3 analyze_motility.py tracking.csv --gforce-axis-deg 0
 ```
 
 ### Trajectory graphs
@@ -204,33 +208,48 @@ output/
       trajectories.tiff
       speed_distribution.tiff
       msd.tiff
-      …  (19 analyses × plots + CSVs)
+      …  (25 analyses × plots + CSVs)
 ```
 
 ---
 
-## The 19 motility analyses
+## The 25 motility analyses
 
-| # | Analysis | Key output |
-|---|----------|-----------|
-| 1 | Swimming speed | mean, median, std, P10/P90 µm/s |
-| 2 | Mean Squared Displacement (MSD) | D (µm²/s), α, motion type |
-| 3 | Directional autocorrelation | persistence time τ_p, persistence length |
-| 4 | Run-and-tumble | run length, tumble frequency, tumble fraction |
-| 5 | Drift vector | population-level directional bias |
-| 6 | Population heterogeneity | slow / normal / hyper-motile fractions |
-| 7 | Boundary collisions | frequency per cell per second |
-| 8 | Bacteria–bacteria collisions | frequency per cell per second |
-| 9 | Velocity autocorrelation (VACF) | zero-crossing time |
-| 10 | Turning angle distribution | forward-biased step fraction |
-| 11 | Track curvature | mean absolute curvature (rad/µm) |
-| 12 | Confinement ratio | end-to-end / total path length |
-| 13 | Speed–persistence correlation | Pearson r |
-| 14 | Non-Gaussianity α₂ | peak α₂ |
-| 15 | Active / stationary phases | mean active fraction per track |
-| 16 | Speed–track-length correlation | Pearson r |
-| 17 | Pair correlation g(r) | spatial clustering |
-| 18 | Spatial velocity correlation C_v(r) | collective motion range |
-| 19 | Near-wall speed profile | speed vs distance from boundary |
+### Per-timepoint analyses
 
-Cross-timepoint analyses (when >1 CSV supplied): speed comparison, motility timeseries, subpopulation evolution, pairwise KS and Mann-Whitney U tests.
+| # | Analysis | Key output | Biophysical question |
+|---|----------|-----------|----------------------|
+| 1 | Swimming speed | mean, median, std, P10/P90 µm/s | How fast are cells swimming? |
+| 2 | Mean Squared Displacement (MSD) | D (µm²/s), α, motion type | Is motion directed, diffusive, or confined (population average)? |
+| 3 | Directional autocorrelation | persistence time τ_p, persistence length | How long does a cell maintain its swimming direction? |
+| 4 | Run-and-tumble | run length, tumble frequency, tumble fraction | How often do cells change direction? |
+| 5 | Drift vector | magnitude and angle of population drift | Is there a net collective drift in one direction? |
+| 6 | Population heterogeneity | slow / normal / hyper-motile fractions | What fraction of cells are highly motile vs barely moving? |
+| 7 | Boundary collisions | frequency per cell per second | How often do cells encounter the arena wall? |
+| 8 | Bacteria–bacteria collisions | frequency per cell per second | How often do cells collide with each other? |
+| 9 | Velocity autocorrelation (VACF) | zero-crossing time | How quickly does a cell's velocity decorrelate from itself? |
+| 10 | Turning angle distribution | forward-biased step fraction | Are cells biased toward straight runs or sharp turns? |
+| 11 | Track curvature | mean absolute curvature (rad/µm) | How curved are swimming paths? |
+| 12 | Confinement ratio | end-to-end / total path length | How far do cells travel from their starting point relative to total path? |
+| 13 | Speed–persistence correlation | Pearson r | Do faster cells also swim straighter? |
+| 14 | Non-Gaussianity α₂ | peak α₂ | Is displacement heterogeneous beyond what Gaussian statistics predict? |
+| 15 | Active / stationary phases | mean active fraction per track | What fraction of each cell's time is spent actively swimming? |
+| 16 | Speed–track-length correlation | Pearson r | Do longer-lived tracks belong to faster or slower cells? |
+| 17 | Pair correlation g(r) | spatial clustering profile | Are cells spatially clustered or uniformly distributed? |
+| 18 | Spatial velocity correlation C_v(r) | collective alignment length scale | At what distance does collective swimming alignment decay? |
+| 19 | Near-wall speed profile | speed vs distance from boundary | Do cells near walls swim differently from cells in the bulk? |
+| 20 | Per-track α distribution | histogram of individual MSD exponents | Are all cells the same motion type, or is there a mixture of confined/diffusive/directed cells? |
+| 21 | Gravitaxis / G-force directional bias | bias index, p-value, rose diagram | Do cells preferentially swim toward or away from the G-force direction? |
+| 22 | Motility state dwell-time analysis | mean active/stationary dwell times, switching rates | How long do cells stay active or stationary before switching? Relates to flagellar motor switching rate. |
+| 23 | Multi-feature behavioral clustering | cluster labels, fractions, scatter matrix | What distinct behavioral phenotypes exist in the population, defined by speed + motion type + path shape? |
+| 24 | Polar order parameter φ | φ vs time (0 = random, 1 = fully aligned) | Does collective swimming alignment emerge or break down over time? |
+| 25 | Speed power spectral density (PSD) | frequency spectrum of speed fluctuations | Are there characteristic frequencies in swimming activity? Changes in peak frequency indicate motor-level biophysical shifts. |
+
+### Cross-timepoint analyses (when >1 CSV supplied)
+
+| Analysis | Output |
+|----------|--------|
+| Speed comparison | Box/violin plot across all conditions |
+| Motility timeseries | Key metrics plotted vs timepoint |
+| Subpopulation evolution | Slow/normal/hyper fractions across timepoints |
+| Statistical comparisons | Pairwise KS test + Mann-Whitney U p-values (`statistical_comparisons.csv`) |
