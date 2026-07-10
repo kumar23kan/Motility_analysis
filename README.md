@@ -15,6 +15,7 @@ Python 3.9+ and the following packages:
 | pandas ≥ 1.5 | Data handling |
 | matplotlib ≥ 3.6 | Plotting |
 | scipy ≥ 1.10 | Statistics |
+| scikit-learn ≥ 1.2 | Behavioral clustering (optional — falls back to scipy k-means if absent) |
 | opencv-python-headless ≥ 4.7 | Image preprocessing |
 | trackpy ≥ 0.6 | Particle tracking |
 | Pillow ≥ 9.0 | GUI image display |
