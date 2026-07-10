@@ -1309,17 +1309,28 @@ class MotilityGUI(tk.Tk):
             'Too high → all bacteria appear partially stationary; active fraction drops '
             'and mean active-phase speed rises.\n\n'
             'Affects: active/stationary phase analysis (#15) — active fraction, mean active '
-            'speed, and stationary cell subpopulation count.')
+            'speed, and stationary cell subpopulation count; dwell-time analysis (#22).')
+        self.pl_gforce_var  = self._param_row(p, 3, 'G-force axis (°)', tk.DoubleVar, 90.0,
+            'Direction of G-force in image coords (90=down)',
+            'Direction of the G-force (gravity / centrifugal) in image pixel coordinates.\n\n'
+            'Measured in degrees clockwise from the positive X-axis (rightward):\n'
+            '  0° = rightward (+X)\n'
+            '  90° = downward (+Y, the default for a horizontal microscope stage)\n'
+            '  180° = leftward\n'
+            '  270° = upward\n\n'
+            'Affects: gravitaxis / G-force directional bias analysis (#21) — bias index '
+            'and rose diagram. Change this if the G-force direction in your experiment '
+            'is not "down" in the image.')
         ttk.Separator(p, orient='horizontal').grid(
-            row=3, column=0, columnspan=3, sticky='ew', pady=8)
+            row=4, column=0, columnspan=3, sticky='ew', pady=8)
         self.pl_skip_bac_var = tk.BooleanVar(value=False)
         self.pl_skip_gr_var  = tk.BooleanVar(value=False)
         ttk.Checkbutton(p, text='Skip bacteria–bacteria collisions',
                         variable=self.pl_skip_bac_var,
-                        ).grid(row=4, column=0, columnspan=3, sticky='w')
+                        ).grid(row=5, column=0, columnspan=3, sticky='w')
         ttk.Checkbutton(p, text='Skip pair correlation g(r)  (slow for large datasets)',
                         variable=self.pl_skip_gr_var,
-                        ).grid(row=5, column=0, columnspan=3, sticky='w')
+                        ).grid(row=6, column=0, columnspan=3, sticky='w')
 
     # ── Parameter tuner launcher ──────────────────────────────────────────────
 
@@ -1509,26 +1520,36 @@ class MotilityGUI(tk.Tk):
             'Too high → all bacteria appear partially stationary; active fraction drops '
             'and mean active-phase speed rises.\n\n'
             'Affects: active/stationary phase analysis (#15) — active fraction, mean '
-            'active speed, stationary cell subpopulation count.')
+            'active speed, stationary cell subpopulation count; dwell-time analysis (#22).')
+        self.gforce_var  = self._param_row(p, 3, 'G-force axis (°)', tk.DoubleVar, 90.0,
+            'Direction of G-force in image coords (90=down)',
+            'Direction of the G-force (gravity / centrifugal) in image pixel coordinates.\n\n'
+            'Measured in degrees clockwise from the positive X-axis (rightward):\n'
+            '  0° = rightward (+X)\n'
+            '  90° = downward (+Y, default for a horizontal microscope stage)\n'
+            '  180° = leftward\n'
+            '  270° = upward\n\n'
+            'Affects: gravitaxis / G-force directional bias analysis (#21) — bias index '
+            'and rose diagram.')
         ttk.Separator(p, orient='horizontal').grid(
-            row=3, column=0, columnspan=3, sticky='ew', pady=8)
+            row=4, column=0, columnspan=3, sticky='ew', pady=8)
         ttk.Label(p, text='Arena boundaries  (leave empty → auto-detect from data)',
                   foreground='grey', font=('TkDefaultFont', 8),
-                  ).grid(row=4, column=0, columnspan=3, sticky='w')
-        self.bnd_xlo_var = self._param_row(p, 5, 'Boundary X lo (µm)', tk.StringVar, '', '')
-        self.bnd_xhi_var = self._param_row(p, 6, 'Boundary X hi (µm)', tk.StringVar, '', '')
-        self.bnd_ylo_var = self._param_row(p, 7, 'Boundary Y lo (µm)', tk.StringVar, '', '')
-        self.bnd_yhi_var = self._param_row(p, 8, 'Boundary Y hi (µm)', tk.StringVar, '', '')
+                  ).grid(row=5, column=0, columnspan=3, sticky='w')
+        self.bnd_xlo_var = self._param_row(p, 6, 'Boundary X lo (µm)', tk.StringVar, '', '')
+        self.bnd_xhi_var = self._param_row(p, 7, 'Boundary X hi (µm)', tk.StringVar, '', '')
+        self.bnd_ylo_var = self._param_row(p, 8, 'Boundary Y lo (µm)', tk.StringVar, '', '')
+        self.bnd_yhi_var = self._param_row(p, 9, 'Boundary Y hi (µm)', tk.StringVar, '', '')
         ttk.Separator(p, orient='horizontal').grid(
-            row=9, column=0, columnspan=3, sticky='ew', pady=8)
+            row=10, column=0, columnspan=3, sticky='ew', pady=8)
         self.skip_bac_var = tk.BooleanVar(value=False)
         self.skip_gr_var  = tk.BooleanVar(value=False)
         ttk.Checkbutton(p, text='Skip bacteria–bacteria collisions  (recommended for >10 000 bacteria/frame)',
                         variable=self.skip_bac_var,
-                        ).grid(row=10, column=0, columnspan=3, sticky='w')
+                        ).grid(row=11, column=0, columnspan=3, sticky='w')
         ttk.Checkbutton(p, text='Skip pair correlation g(r)  (slow for large datasets)',
                         variable=self.skip_gr_var,
-                        ).grid(row=11, column=0, columnspan=3, sticky='w')
+                        ).grid(row=12, column=0, columnspan=3, sticky='w')
 
     # ── Shared bottom (output folder + log + controls) ────────────────────────
 
@@ -1799,6 +1820,7 @@ class MotilityGUI(tk.Tk):
             '--tumble-angle',     str(self.pl_tumble_var.get()),
             '--max-lag',          str(self.pl_maxlag_var.get()),
             '--stationary-speed', str(self.pl_statsp_var.get()),
+            '--gforce-axis-deg',  str(self.pl_gforce_var.get()),
             '--output-dir',       str(ana_out),
         ]
         if roi_file:
@@ -1841,6 +1863,7 @@ class MotilityGUI(tk.Tk):
             '--tumble-angle',     str(self.tumble_var.get()),
             '--max-lag',          str(self.max_lag_var.get()),
             '--stationary-speed', str(self.stat_sp_var.get()),
+            '--gforce-axis-deg',  str(self.gforce_var.get()),
             '--output-dir',       self.out_var.get() or 'motility_analysis',
         ]
         if self.skip_bac_var.get():

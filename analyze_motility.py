@@ -25,11 +25,17 @@ Analyses (per file):
   17. Pair correlation function g(r)
   18. Spatial velocity correlation C_v(r)
   19. Near-wall speed profile
+  20. Per-track α (MSD exponent) distribution
+  21. Gravitaxis / G-force directional bias
+  22. Motility state dwell-time analysis
+  23. Multi-feature behavioral clustering
+  24. Polar order parameter
+  25. Speed power spectral density (PSD)
 
 Cross-file analyses (when >1 CSV supplied):
-  20. Motility time-series across conditions / timepoints
-  21. Statistical comparisons (KS test + Mann-Whitney U)
-  22. Subpopulation fraction evolution
+  A. Motility time-series across conditions / timepoints
+  B. Statistical comparisons (KS test + Mann-Whitney U)
+  C. Subpopulation fraction evolution
 
 Usage:
   python analyze_motility.py data.csv
@@ -103,6 +109,10 @@ def parse_args():
                      help='Skip bacteria-bacteria collision detection')
     ana.add_argument('--skip-gr', action='store_true',
                      help='Skip pair-correlation g(r) (slow for large datasets)')
+    ana.add_argument('--gforce-axis-deg', type=float, default=90.0,
+                     help='Direction of the G-force in image coordinates in degrees '
+                          'clockwise from +X (right). 90=downward (+Y), 270=upward. '
+                          'Used for gravitaxis analysis.')
 
     bnd = p.add_argument_group('Arena boundary (µm) — omit any to auto-detect from data')
     bnd.add_argument('--boundary-x-lo', type=float, default=None,
@@ -961,6 +971,347 @@ def compute_near_wall_speed(df, fps, px_per_um, n_bins=20):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 20. Per-track α distribution
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _msd_one_track(x_um, y_um, frames, fps, max_lag):
+    """Compute MSD for a single track. Returns (lag_times, msd_vals)."""
+    n = len(x_um)
+    lags = range(1, min(max_lag + 1, n))
+    lag_times_list = []
+    msd_vals_list = []
+    for lag in lags:
+        dx = x_um[lag:] - x_um[:n - lag]
+        dy = y_um[lag:] - y_um[:n - lag]
+        ok = (frames[lag:] - frames[:n - lag]) == lag
+        if ok.any():
+            msd = float(np.mean(dx[ok] ** 2 + dy[ok] ** 2))
+            lag_times_list.append(lag / fps)
+            msd_vals_list.append(msd)
+    return np.array(lag_times_list), np.array(msd_vals_list)
+
+
+def compute_per_track_alpha(df, fps, max_lag=20, min_lag_points=4):
+    """
+    Fit MSD α exponent per individual track.
+    Returns DataFrame with columns: particle, alpha, D_um2_s, motion_type, n_frames.
+    """
+    rows = []
+    for pid, track in df.groupby('particle'):
+        track = track.sort_values('frame')
+        x_um = track['x_um'].values
+        y_um = track['y_um'].values
+        frames = track['frame'].values
+        n = len(track)
+        if n < min_lag_points + 1:
+            continue
+        lt, mv = _msd_one_track(x_um, y_um, frames, fps, max_lag)
+        if len(lt) < min_lag_points:
+            continue
+        D_val, alpha_val = fit_msd(lt, mv)
+        if alpha_val is None:
+            continue
+        rows.append({
+            'particle':    pid,
+            'alpha':       float(alpha_val),
+            'D_um2_s':     float(D_val) if D_val is not None else float('nan'),
+            'motion_type': motion_label(alpha_val),
+            'n_frames':    n,
+        })
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 21. Gravitaxis / G-force directional bias
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_gravitaxis(df, fps, gforce_axis_deg=90.0):
+    """
+    Compute directional bias toward the G-force axis.
+    Returns dict with bias_index, bias_pvalue, n_steps, angles_deg, cos_biases.
+    """
+    gforce_axis_rad = np.radians(gforce_axis_deg)
+    angles_list = []
+    cos_list = []
+
+    for _, track in df.groupby('particle'):
+        track = track.sort_values('frame')
+        fr = track['frame'].values
+        x = track['x_um'].values
+        y = track['y_um'].values
+        n = len(track)
+        for i in range(n - 1):
+            if fr[i + 1] - fr[i] == 1:
+                dx = x[i + 1] - x[i]
+                dy = y[i + 1] - y[i]
+                if np.hypot(dx, dy) > 0:
+                    angle_rad = np.arctan2(dy, dx)
+                    angles_list.append(np.degrees(angle_rad))
+                    cos_list.append(float(np.cos(angle_rad - gforce_axis_rad)))
+
+    if len(cos_list) < 3:
+        return {
+            'bias_index':  0.0,
+            'bias_pvalue': 1.0,
+            'n_steps':     0,
+            'angles_deg':  np.array([]),
+            'cos_biases':  np.array([]),
+        }
+
+    cos_arr = np.array(cos_list)
+    t_stat, pvalue = spstats.ttest_1samp(cos_arr, 0.0)
+    return {
+        'bias_index':  float(np.mean(cos_arr)),
+        'bias_pvalue': float(pvalue),
+        'n_steps':     len(cos_arr),
+        'angles_deg':  np.array(angles_list),
+        'cos_biases':  cos_arr,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 22. Motility state dwell-time analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_dwell_times(df, fps, stationary_speed_um_s=0.5):
+    """
+    For each track, classify steps as 'active' or 'stationary', then collect
+    contiguous run durations. Returns dict with dwell times and statistics.
+    """
+    active_dwells = []
+    stationary_dwells = []
+
+    for _, track in df.groupby('particle'):
+        track = track.sort_values('frame')
+        fr = track['frame'].values
+        x = track['x_um'].values
+        y = track['y_um'].values
+        n = len(track)
+
+        states = []
+        for i in range(n - 1):
+            if fr[i + 1] - fr[i] == 1:
+                sp = np.hypot(x[i + 1] - x[i], y[i + 1] - y[i]) * fps
+                states.append('active' if sp >= stationary_speed_um_s else 'stationary')
+
+        if not states:
+            continue
+
+        # Identify contiguous runs
+        current_state = states[0]
+        run_count = 1
+        for s in states[1:]:
+            if s == current_state:
+                run_count += 1
+            else:
+                dwell_s = run_count / fps
+                if current_state == 'active':
+                    active_dwells.append(dwell_s)
+                else:
+                    stationary_dwells.append(dwell_s)
+                current_state = s
+                run_count = 1
+        # Last run
+        dwell_s = run_count / fps
+        if current_state == 'active':
+            active_dwells.append(dwell_s)
+        else:
+            stationary_dwells.append(dwell_s)
+
+    mean_active = float(np.mean(active_dwells)) if active_dwells else 0.0
+    mean_stat = float(np.mean(stationary_dwells)) if stationary_dwells else 0.0
+    return {
+        'active_dwell_times':       active_dwells,
+        'stationary_dwell_times':   stationary_dwells,
+        'mean_active_dwell_s':      mean_active,
+        'mean_stationary_dwell_s':  mean_stat,
+        'active_switching_rate_hz': 1.0 / mean_active if mean_active > 0 else 0.0,
+        'stationary_switching_rate_hz': 1.0 / mean_stat if mean_stat > 0 else 0.0,
+        'n_active_bouts':      len(active_dwells),
+        'n_stationary_bouts':  len(stationary_dwells),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 23. Multi-feature behavioral clustering
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_behavioral_clusters(pt_df, alpha_df, cr_df, curv_df, n_clusters=3):
+    """
+    Merge per-track DataFrames and cluster on speed, alpha, confinement_ratio,
+    mean_curvature_rad_um. Uses GaussianMixture (sklearn) or kmeans2 (scipy).
+    Returns (cluster_df, cluster_stats).
+    """
+    merged = pt_df[['particle', 'mean_speed_um_s']].copy()
+    if not alpha_df.empty:
+        merged = merged.merge(alpha_df[['particle', 'alpha']], on='particle', how='left')
+    else:
+        merged['alpha'] = float('nan')
+    if not cr_df.empty:
+        merged = merged.merge(cr_df[['particle', 'confinement_ratio']], on='particle', how='left')
+    else:
+        merged['confinement_ratio'] = float('nan')
+    if not curv_df.empty:
+        merged = merged.merge(curv_df[['particle', 'mean_curvature_rad_um']], on='particle', how='left')
+    else:
+        merged['mean_curvature_rad_um'] = float('nan')
+
+    features = ['mean_speed_um_s', 'alpha', 'confinement_ratio', 'mean_curvature_rad_um']
+    merged = merged.dropna(subset=features).reset_index(drop=True)
+
+    if len(merged) < n_clusters:
+        merged['cluster'] = 0
+        cluster_stats = {'sizes': {0: 1.0}, 'means': {}}
+        return merged, cluster_stats
+
+    X = merged[features].values.astype(float)
+    # Standardize
+    X_mean = X.mean(axis=0)
+    X_std = X.std(axis=0)
+    X_std[X_std == 0] = 1.0
+    X_scaled = (X - X_mean) / X_std
+
+    labels = None
+    try:
+        from sklearn.mixture import GaussianMixture
+        from sklearn.preprocessing import StandardScaler
+        gm = GaussianMixture(n_components=n_clusters, random_state=42, n_init=3)
+        labels = gm.fit_predict(X_scaled)
+    except ImportError:
+        try:
+            from scipy.cluster.vq import kmeans2, whiten
+            _, labels = kmeans2(X_scaled, n_clusters, seed=42, minit='points')
+        except Exception:
+            labels = np.zeros(len(merged), dtype=int)
+
+    if labels is None:
+        labels = np.zeros(len(merged), dtype=int)
+
+    merged['cluster'] = labels
+
+    # Cluster stats
+    total = len(merged)
+    cluster_stats = {'sizes': {}, 'means': {}}
+    for c in sorted(merged['cluster'].unique()):
+        sub = merged[merged['cluster'] == c]
+        cluster_stats['sizes'][int(c)] = len(sub) / total
+        cluster_stats['means'][int(c)] = {f: float(sub[f].mean()) for f in features}
+
+    return merged, cluster_stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 24. Polar order parameter
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_polar_order(df, fps):
+    """
+    Compute polar order φ = |mean unit velocity vector| per frame.
+    Returns (frames_arr, phi_arr).
+    """
+    df_sorted = df.sort_values(['particle', 'frame']).copy()
+    g = df_sorted.groupby('particle')
+    df_sorted['vx'] = g['x_um'].diff() * fps
+    df_sorted['vy'] = g['y_um'].diff() * fps
+    df_sorted['d_frame'] = g['frame'].diff()
+    df_v = df_sorted[df_sorted['d_frame'] == 1].copy()
+    vmag = np.hypot(df_v['vx'], df_v['vy'])
+    df_v = df_v[vmag > 0].copy()
+    df_v['vx_n'] = df_v['vx'] / np.hypot(df_v['vx'], df_v['vy'])
+    df_v['vy_n'] = df_v['vy'] / np.hypot(df_v['vx'], df_v['vy'])
+
+    frames_list = []
+    phi_list = []
+    for fid, fdata in df_v.groupby('frame'):
+        if len(fdata) < 3:
+            continue
+        phi = float(np.hypot(fdata['vx_n'].mean(), fdata['vy_n'].mean()))
+        frames_list.append(int(fid))
+        phi_list.append(phi)
+
+    return np.array(frames_list, dtype=int), np.array(phi_list)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 25. Speed power spectral density (PSD)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_speed_psd(df, fps, max_tracks=300):
+    """
+    Compute average speed PSD across tracks.
+    Returns (frequencies, mean_psd, std_psd) in Hz and µm²/s²/Hz.
+    """
+    particles = df['particle'].unique()
+    if len(particles) > max_tracks:
+        rng = np.random.default_rng(42)
+        particles = rng.choice(particles, max_tracks, replace=False)
+
+    all_psds = []
+    target_len = None
+
+    for pid in particles:
+        track = df[df['particle'] == pid].sort_values('frame')
+        fr = track['frame'].values
+        x = track['x_um'].values
+        y = track['y_um'].values
+        n = len(track)
+
+        # Compute instantaneous speeds for consecutive frames
+        speeds_t = []
+        for i in range(n - 1):
+            if fr[i + 1] - fr[i] == 1:
+                sp = np.hypot(x[i + 1] - x[i], y[i + 1] - y[i]) * fps
+                speeds_t.append(sp)
+
+        if len(speeds_t) < 8:
+            continue
+
+        speeds_arr = np.array(speeds_t)
+        # Find next power of 2
+        nfft = 1
+        while nfft < len(speeds_arr):
+            nfft <<= 1
+
+        if target_len is None:
+            target_len = nfft
+        else:
+            target_len = min(target_len, nfft)
+
+        # Interpolate to uniform grid of length nfft
+        t_orig = np.arange(len(speeds_arr)) / fps
+        t_new = np.linspace(0, t_orig[-1], nfft)
+        speeds_interp = np.interp(t_new, t_orig, speeds_arr)
+
+        # Apply Hanning window
+        window = np.hanning(nfft)
+        speeds_win = speeds_interp * window
+
+        # FFT power spectrum (one-sided)
+        fft_vals = np.fft.rfft(speeds_win)
+        psd = (np.abs(fft_vals) ** 2) / (fps * nfft)
+        # Scale for one-sided spectrum
+        psd[1:-1] *= 2
+
+        all_psds.append(psd)
+
+    if not all_psds:
+        return np.array([]), np.array([]), np.array([])
+
+    # Trim all PSDs to shortest length
+    min_len = min(len(p) for p in all_psds)
+    all_psds = np.array([p[:min_len] for p in all_psds])
+
+    mean_psd = np.mean(all_psds, axis=0)
+    std_psd = np.std(all_psds, axis=0)
+
+    # Frequency axis — use the length from the first psd to get correct nfft
+    nfft_ref = (min_len - 1) * 2
+    frequencies = np.fft.rfftfreq(nfft_ref, d=1.0 / fps)[:min_len]
+
+    return frequencies, mean_psd, std_psd
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Cross-file analyses
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1268,6 +1619,200 @@ def plot_near_wall_speed(dist, mean_sp, std_sp, out_path, title):
     ax.set_xlabel('Distance to nearest wall (µm)'); ax.set_ylabel('Speed (µm/s)')
     ax.set_title(title); ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
     plt.tight_layout(); _save(fig, out_path)
+
+
+def plot_per_track_alpha(alpha_df, out_path, title):
+    if alpha_df.empty:
+        return
+    alphas = alpha_df['alpha'].values
+    subdiff = alphas[alphas < 0.9]
+    diffusive = alphas[(alphas >= 0.9) & (alphas <= 1.5)]
+    ballistic = alphas[alphas > 1.5]
+    total = len(alphas)
+    frac_sub  = len(subdiff)  / total if total > 0 else 0.0
+    frac_diff = len(diffusive) / total if total > 0 else 0.0
+    frac_ball = len(ballistic) / total if total > 0 else 0.0
+
+    cap = min(np.percentile(alphas, 99), 3.0) if len(alphas) > 0 else 3.0
+    bins = np.linspace(max(0, alphas.min() - 0.1), min(cap + 0.1, 4.0), 60)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    if len(subdiff) > 0:
+        ax.hist(subdiff,  bins=bins, color='steelblue', alpha=0.75,
+                label=f'Subdiffusive α<0.9  ({frac_sub:.1%})')
+    if len(diffusive) > 0:
+        ax.hist(diffusive, bins=bins, color='green', alpha=0.75,
+                label=f'Diffusive 0.9≤α≤1.5  ({frac_diff:.1%})')
+    if len(ballistic) > 0:
+        ax.hist(ballistic, bins=bins, color='red', alpha=0.75,
+                label=f'Ballistic α>1.5  ({frac_ball:.1%})')
+
+    ax.axvline(0.9, color='steelblue', ls='--', lw=1.5, label='α=0.9 (diffusive boundary)')
+    ax.axvline(1.5, color='red',       ls='--', lw=1.5, label='α=1.5 (ballistic boundary)')
+    ax.axvline(float(np.median(alphas)), color='orange', ls=':', lw=1.5,
+               label=f'Median α={np.median(alphas):.2f}')
+
+    ax.text(0.97, 0.97,
+            f'Sub: {frac_sub:.1%}\nDiff: {frac_diff:.1%}\nBall: {frac_ball:.1%}',
+            transform=ax.transAxes, ha='right', va='top', fontsize=9,
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    ax.set_xlabel('α (MSD exponent per track)')
+    ax.set_ylabel('Count')
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    _save(fig, out_path)
+
+
+def plot_gravitaxis(result, gforce_axis_deg, out_path, title):
+    angles_deg = result['angles_deg']
+    if len(angles_deg) == 0:
+        return
+    angles_rad = np.radians(angles_deg)
+    fig, ax = plt.subplots(subplot_kw=dict(projection='polar'), figsize=(6, 6))
+    bins = np.linspace(-np.pi, np.pi, 37)
+    counts, edges = np.histogram(angles_rad, bins=bins)
+    bin_centers = 0.5 * (edges[:-1] + edges[1:])
+    bar_width = edges[1] - edges[0]
+    ax.bar(bin_centers, counts, width=bar_width, bottom=0,
+           color='steelblue', alpha=0.7, edgecolor='white', linewidth=0.3)
+
+    # Draw red arrow for G-force direction
+    gforce_rad = np.radians(gforce_axis_deg) - np.pi / 2  # convert image CW-from-X to math CCW-from-X
+    # In image coords: angle measured CW from +X (+Y is down)
+    # atan2 in compute_gravitaxis uses image convention, so convert to math polar
+    gforce_plot_rad = -np.radians(gforce_axis_deg)  # negate because polar is CCW
+    r_max = counts.max() if counts.max() > 0 else 1
+    ax.annotate('', xy=(gforce_plot_rad, r_max * 1.15), xytext=(gforce_plot_rad, 0),
+                arrowprops=dict(arrowstyle='->', color='red', lw=2.5))
+
+    bias_idx = result['bias_index']
+    pval = result['bias_pvalue']
+    ax.set_title(f'{title}\nBias index = {bias_idx:.3f}  p = {pval:.2e}', pad=20)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    _save(fig, out_path)
+
+
+def plot_dwell_times(result, out_path, title):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    for ax, key, label, color in [
+        (axes[0], 'active_dwell_times',     'Active',     'steelblue'),
+        (axes[1], 'stationary_dwell_times', 'Stationary', 'salmon'),
+    ]:
+        dwells = result[key]
+        if not dwells:
+            ax.set_title(f'{label} (no data)')
+            continue
+        dwells_arr = np.array(dwells)
+        tau = float(np.mean(dwells_arr))
+        rate = 1.0 / tau if tau > 0 else 0.0
+
+        cap = np.percentile(dwells_arr, 98) if len(dwells_arr) > 2 else dwells_arr.max()
+        cap = max(cap, 1e-9)
+        bins = np.linspace(0, cap, 40)
+        counts, edges, _ = ax.hist(dwells_arr[dwells_arr <= cap], bins=bins,
+                                   color=color, alpha=0.75, edgecolor='white', lw=0.3,
+                                   label=f'Mean = {tau:.3f} s\nRate = {rate:.3f} Hz')
+
+        # Overlay exponential fit
+        if tau > 0 and len(bins) > 2:
+            t_fit = np.linspace(0, cap, 200)
+            bin_width = bins[1] - bins[0]
+            n_total = len(dwells_arr[dwells_arr <= cap])
+            scale = n_total * bin_width / tau
+            ax.plot(t_fit, scale * np.exp(-t_fit / tau), '-', color='darkred', lw=2,
+                    label=f'Exp fit (τ={tau:.3f} s)')
+
+        ax.set_xlabel('Dwell time (s)')
+        ax.set_ylabel('Count')
+        ax.set_title(f'{label} dwell times')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle(title, fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    _save(fig, out_path)
+
+
+def plot_behavioral_clusters(cluster_df, cluster_stats, out_path, title):
+    if cluster_df.empty:
+        return
+    clusters = sorted(cluster_df['cluster'].unique())
+    n_clusters = len(clusters)
+    cmap = plt.cm.Set1(np.linspace(0, 0.8, max(n_clusters, 1)))
+    color_map = {c: cmap[i] for i, c in enumerate(clusters)}
+
+    pairs = [
+        ('mean_speed_um_s', 'alpha',              'Speed (µm/s)', 'α'),
+        ('mean_speed_um_s', 'confinement_ratio',  'Speed (µm/s)', 'Confinement ratio'),
+        ('alpha',           'confinement_ratio',  'α',            'Confinement ratio'),
+        ('confinement_ratio', 'mean_curvature_rad_um', 'Confinement ratio', 'Curvature (rad/µm)'),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    axes = axes.flatten()
+
+    for ax, (xcol, ycol, xlabel, ylabel) in zip(axes, pairs):
+        if xcol not in cluster_df.columns or ycol not in cluster_df.columns:
+            continue
+        for c in clusters:
+            sub = cluster_df[cluster_df['cluster'] == c]
+            frac = cluster_stats['sizes'].get(int(c), 0.0)
+            ax.scatter(sub[xcol], sub[ycol], alpha=0.4, s=8,
+                       color=color_map[c], label=f'Cluster {c}  ({frac:.0%})')
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle(title, fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    _save(fig, out_path)
+
+
+def plot_polar_order(frames, phi, fps, out_path, title):
+    if len(frames) == 0:
+        return
+    times = frames / fps
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(times, phi, '-', color='steelblue', lw=1.2)
+    ax.fill_between(times, 0, phi, alpha=0.2, color='steelblue')
+    ax.axhline(0.5, color='red', ls='--', lw=1.5, alpha=0.7, label='φ = 0.5 reference')
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Polar order φ')
+    ax.set_ylim(0, 1)
+    ax.set_title(title)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    _save(fig, out_path)
+
+
+def plot_speed_psd(frequencies, mean_psd, std_psd, out_path, title):
+    if len(frequencies) == 0:
+        return
+    # Exclude DC component (index 0)
+    ok = (frequencies > 0) & np.isfinite(mean_psd) & (mean_psd > 0)
+    if not ok.any():
+        return
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.loglog(frequencies[ok], mean_psd[ok], '-', color='steelblue', lw=1.5)
+    psd_lower = np.maximum(mean_psd[ok] - std_psd[ok], 1e-20)
+    ax.fill_between(frequencies[ok], psd_lower, mean_psd[ok] + std_psd[ok],
+                    alpha=0.2, color='steelblue', label='±1 std')
+    ax.axvline(1.0,  color='red',    ls='--', lw=1.2, alpha=0.7, label='1 Hz')
+    ax.axvline(10.0, color='orange', ls='--', lw=1.2, alpha=0.7, label='10 Hz')
+    ax.set_xlabel('Frequency (Hz)')
+    ax.set_ylabel('PSD (µm²/s² / Hz)')
+    ax.set_title(title)
+    ax.legend(fontsize=9)
+    ax.grid(True, which='both', alpha=0.3)
+    plt.tight_layout()
+    _save(fig, out_path)
 
 
 def plot_speed_comparison(all_speeds, out_path):
@@ -1578,6 +2123,75 @@ def analyze_file(csv_path, args, root_out):
     print('[19] Near-wall speed profile ...', flush=True)
     nw_dist, nw_speed, nw_std = compute_near_wall_speed(df, fps, px_per_um)
 
+    # ── 20. Per-track α distribution ──────────────────────────────────────────
+    print('[20] Per-track α distribution ...', flush=True)
+    alpha_df = compute_per_track_alpha(df, fps, max_lag=args.max_lag)
+    if not alpha_df.empty:
+        alpha_median = float(alpha_df['alpha'].median())
+        alpha_std    = float(alpha_df['alpha'].std())
+        frac_sub  = float((alpha_df['alpha'] < 0.9).mean())
+        frac_diff_pt = float(((alpha_df['alpha'] >= 0.9) & (alpha_df['alpha'] <= 1.5)).mean())
+        frac_ball = float((alpha_df['alpha'] > 1.5).mean())
+        print(f"      {len(alpha_df)} tracks  median α={alpha_median:.3f}  "
+              f"sub={frac_sub:.1%}  diff={frac_diff_pt:.1%}  ball={frac_ball:.1%}")
+    else:
+        alpha_median = alpha_std = frac_sub = frac_diff_pt = frac_ball = None
+
+    # ── 21. Gravitaxis / G-force directional bias ─────────────────────────────
+    print('[21] Gravitaxis / G-force directional bias ...', flush=True)
+    grav_result = compute_gravitaxis(df, fps,
+                                     gforce_axis_deg=getattr(args, 'gforce_axis_deg', 90.0))
+    print(f"      bias_index = {grav_result['bias_index']:.4f}  "
+          f"p = {grav_result['bias_pvalue']:.3e}  "
+          f"n_steps = {grav_result['n_steps']:,}")
+
+    # ── 22. Dwell-time analysis ────────────────────────────────────────────────
+    print('[22] Motility state dwell-time analysis ...', flush=True)
+    dwell_result = compute_dwell_times(df, fps,
+                                       stationary_speed_um_s=args.stationary_speed)
+    print(f"      mean active dwell = {dwell_result['mean_active_dwell_s']:.3f} s  "
+          f"rate = {dwell_result['active_switching_rate_hz']:.3f} Hz  "
+          f"(n={dwell_result['n_active_bouts']})")
+
+    # ── 23. Behavioral clustering ──────────────────────────────────────────────
+    print('[23] Multi-feature behavioral clustering ...', flush=True)
+    cluster_df, cluster_stats = compute_behavioral_clusters(pt_df, alpha_df, cr_df, curv_df)
+    n_clust = len(cluster_stats['sizes'])
+    clust_frac_str = ','.join(f'{cluster_stats["sizes"][c]:.2f}'
+                              for c in sorted(cluster_stats['sizes']))
+    print(f"      {n_clust} clusters  fracs = {clust_frac_str}")
+
+    # ── 24. Polar order parameter ──────────────────────────────────────────────
+    print('[24] Polar order parameter ...', flush=True)
+    po_frames, po_phi = compute_polar_order(df, fps)
+    if len(po_phi) > 0:
+        po_mean = float(np.mean(po_phi))
+        po_max  = float(np.max(po_phi))
+        po_std  = float(np.std(po_phi))
+        print(f"      mean φ = {po_mean:.4f}  max φ = {po_max:.4f}  std φ = {po_std:.4f}")
+    else:
+        po_mean = po_max = po_std = None
+        print('      insufficient data for polar order')
+
+    # ── 25. Speed PSD ──────────────────────────────────────────────────────────
+    print('[25] Speed power spectral density ...', flush=True)
+    psd_freq, psd_mean, psd_std = compute_speed_psd(df, fps)
+    if len(psd_freq) > 0:
+        # Find peak excluding DC (index 0)
+        ok_psd = (psd_freq > 0) & np.isfinite(psd_mean)
+        if ok_psd.any():
+            peak_idx = int(np.argmax(psd_mean[ok_psd]))
+            psd_peak_freq  = float(psd_freq[ok_psd][peak_idx])
+            psd_peak_power = float(psd_mean[ok_psd][peak_idx])
+        else:
+            psd_peak_freq = psd_peak_power = None
+        print(f"      peak freq = {psd_peak_freq:.3f} Hz  "
+              f"peak power = {psd_peak_power:.4e} µm²/s²/Hz"
+              if psd_peak_freq is not None else '      PSD computed')
+    else:
+        psd_peak_freq = psd_peak_power = None
+        print('      insufficient data for speed PSD')
+
     # ── Save plots ─────────────────────────────────────────────────────────────
     print('\n  Saving plots ...', flush=True)
     ext = _FMT
@@ -1642,6 +2256,31 @@ def analyze_file(csv_path, args, root_out):
     plot_near_wall_speed(nw_dist, nw_speed, nw_std,
                          out_dir / f'near_wall_speed_profile{ext}',
                          f'Near-Wall Speed Profile — {name}')
+    if not alpha_df.empty:
+        plot_per_track_alpha(alpha_df,
+                             out_dir / f'per_track_alpha_dist{ext}',
+                             f'Per-Track α Distribution — {name}')
+    if grav_result['n_steps'] > 0:
+        plot_gravitaxis(grav_result,
+                        getattr(args, 'gforce_axis_deg', 90.0),
+                        out_dir / f'gravitaxis{ext}',
+                        f'Gravitaxis / G-Force Bias — {name}')
+    if dwell_result['n_active_bouts'] > 0 or dwell_result['n_stationary_bouts'] > 0:
+        plot_dwell_times(dwell_result,
+                         out_dir / f'dwell_times{ext}',
+                         f'Dwell-Time Analysis — {name}')
+    if not cluster_df.empty:
+        plot_behavioral_clusters(cluster_df, cluster_stats,
+                                 out_dir / f'behavioral_clusters{ext}',
+                                 f'Behavioral Clusters — {name}')
+    if len(po_phi) > 0:
+        plot_polar_order(po_frames, po_phi, fps,
+                         out_dir / f'polar_order{ext}',
+                         f'Polar Order Parameter — {name}')
+    if len(psd_freq) > 0:
+        plot_speed_psd(psd_freq, psd_mean, psd_std,
+                       out_dir / f'speed_psd{ext}',
+                       f'Speed PSD — {name}')
 
     # ── Save numerics ─────────────────────────────────────────────────────────
     speeds.to_csv(out_dir / 'speeds.csv', index=False, header=['speed_um_s'])
@@ -1682,6 +2321,38 @@ def analyze_file(csv_path, args, root_out):
                   'mean_speed_um_s': nw_speed,
                   'std_speed_um_s':  nw_std}).to_csv(
         out_dir / 'near_wall_speed.csv', index=False)
+    if not alpha_df.empty:
+        alpha_df.to_csv(out_dir / 'per_track_alpha.csv', index=False)
+    if grav_result['n_steps'] > 0:
+        pd.DataFrame({
+            'angle_deg':  grav_result['angles_deg'],
+            'cos_bias':   grav_result['cos_biases'],
+        }).to_csv(out_dir / 'gravitaxis_angles.csv', index=False)
+    if dwell_result['n_active_bouts'] > 0 or dwell_result['n_stationary_bouts'] > 0:
+        max_len = max(len(dwell_result['active_dwell_times']),
+                      len(dwell_result['stationary_dwell_times']))
+        active_pad = list(dwell_result['active_dwell_times']) + \
+                     [float('nan')] * (max_len - len(dwell_result['active_dwell_times']))
+        stat_pad   = list(dwell_result['stationary_dwell_times']) + \
+                     [float('nan')] * (max_len - len(dwell_result['stationary_dwell_times']))
+        pd.DataFrame({
+            'active_dwell_s':     active_pad,
+            'stationary_dwell_s': stat_pad,
+        }).to_csv(out_dir / 'dwell_times.csv', index=False)
+    if not cluster_df.empty:
+        cluster_df.to_csv(out_dir / 'behavioral_clusters.csv', index=False)
+    if len(po_frames) > 0:
+        pd.DataFrame({
+            'frame':       po_frames,
+            'time_s':      po_frames / fps,
+            'polar_order': po_phi,
+        }).to_csv(out_dir / 'polar_order.csv', index=False)
+    if len(psd_freq) > 0:
+        pd.DataFrame({
+            'frequency_hz': psd_freq,
+            'mean_psd':     psd_mean,
+            'std_psd':      psd_std,
+        }).to_csv(out_dir / 'speed_psd.csv', index=False)
 
     # ── Summary row ───────────────────────────────────────────────────────────
     row = {
@@ -1758,6 +2429,30 @@ def analyze_file(csv_path, args, root_out):
         # speed–track-length
         'speed_tracklength_r': round(stl_r, 4) if stl_r is not None else None,
         'speed_tracklength_p': round(stl_p, 6) if stl_p is not None else None,
+        # per-track alpha
+        'alpha_median_per_track':  round(alpha_median, 4)  if alpha_median  is not None else None,
+        'alpha_std_per_track':     round(alpha_std,    4)  if alpha_std     is not None else None,
+        'frac_subdiffusive':       round(frac_sub,     4)  if frac_sub      is not None else None,
+        'frac_diffusive_per_track':round(frac_diff_pt, 4)  if frac_diff_pt  is not None else None,
+        'frac_ballistic':          round(frac_ball,    4)  if frac_ball     is not None else None,
+        # gravitaxis
+        'gravitaxis_bias_index': round(grav_result['bias_index'],  5),
+        'gravitaxis_pvalue':     round(grav_result['bias_pvalue'], 6),
+        # dwell times
+        'mean_active_dwell_s':         round(dwell_result['mean_active_dwell_s'],          4),
+        'mean_stationary_dwell_s':     round(dwell_result['mean_stationary_dwell_s'],      4),
+        'active_switching_rate_hz':    round(dwell_result['active_switching_rate_hz'],     4),
+        'stationary_switching_rate_hz':round(dwell_result['stationary_switching_rate_hz'], 4),
+        # behavioral clustering
+        'n_behavioral_clusters':   n_clust,
+        'behavioral_cluster_fracs': clust_frac_str,
+        # polar order
+        'polar_order_mean': round(po_mean, 5) if po_mean is not None else None,
+        'polar_order_max':  round(po_max,  5) if po_max  is not None else None,
+        'polar_order_std':  round(po_std,  5) if po_std  is not None else None,
+        # speed PSD
+        'speed_psd_peak_freq_hz':  round(psd_peak_freq,  4) if psd_peak_freq  is not None else None,
+        'speed_psd_peak_power':    round(psd_peak_power, 6) if psd_peak_power is not None else None,
     }
 
     return row, speeds
@@ -1772,7 +2467,7 @@ def main():
     root_out = Path(args.output_dir)
     root_out.mkdir(parents=True, exist_ok=True)
 
-    print('\nBacterial Motility & Collision Analyzer  (19 analyses)')
+    print('\nBacterial Motility & Collision Analyzer  (25 analyses)')
     print(f'  fps={args.fps}  px/µm={args.px_per_um}  '
           f'min_track={args.min_track_length}  bac_r={args.bac_radius} µm  '
           f'ep_max={args.ep_max}  min_mass={args.min_mass}  output={root_out}')
@@ -1824,6 +2519,10 @@ def main():
         'mean_confinement_ratio', 'non_gaussianity_peak',
         'mean_frac_active', 'frac_hypermotile',
         'boundary_freq_per_cell_s', 'bac_bac_freq_per_cell_s',
+        'alpha_median_per_track', 'frac_subdiffusive', 'frac_ballistic',
+        'gravitaxis_bias_index', 'gravitaxis_pvalue',
+        'mean_active_dwell_s', 'mean_stationary_dwell_s',
+        'polar_order_mean', 'speed_psd_peak_freq_hz',
     ]
     avail = [c for c in display if c in s_df.columns]
     print(s_df[avail].to_string(index=False))
